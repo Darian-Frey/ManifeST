@@ -10,7 +10,29 @@ namespace manifest {
 
 namespace {
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
+
+// Full-text-search index applied at user_version 2. Trigram tokenizer gives
+// substring matching, so `find ark` still hits "Arkanoid" the way the
+// old LIKE '%ark%' query did.
+constexpr const char* kFtsSchemaSql = R"SQL(
+CREATE VIRTUAL TABLE IF NOT EXISTS disks_fts USING fts5(
+    title, filename, volume_label, files,
+    tokenize = 'trigram'
+);
+)SQL";
+
+// Applied on migration 1 → 2 to populate the new FTS index from existing rows.
+constexpr const char* kFtsBackfillSql = R"SQL(
+INSERT INTO disks_fts (rowid, title, filename, volume_label, files)
+SELECT d.id,
+       COALESCE(d.identified_title, ''),
+       d.filename,
+       COALESCE(d.volume_label, ''),
+       COALESCE((SELECT GROUP_CONCAT(f.filename, ' ')
+                 FROM files f WHERE f.disk_id = d.id), '')
+FROM disks d;
+)SQL";
 
 constexpr const char* kSchemaSql = R"SQL(
 PRAGMA journal_mode = WAL;
@@ -152,6 +174,9 @@ struct Database::Impl {
     sqlite3_stmt* select_files{nullptr};
     sqlite3_stmt* select_tags{nullptr};
     sqlite3_stmt* select_path_exists{nullptr};
+    sqlite3_stmt* fts_delete{nullptr};
+    sqlite3_stmt* fts_insert{nullptr};
+    sqlite3_stmt* fts_update_files{nullptr};
 
     void prepare(sqlite3_stmt*& out, const char* sql) {
         if (sqlite3_prepare_v2(db, sql, -1, &out, nullptr) != SQLITE_OK) {
@@ -162,7 +187,8 @@ struct Database::Impl {
     void finalizeAll() {
         for (sqlite3_stmt** s : {&upsert_disk, &delete_files, &insert_file,
                                  &delete_tags, &insert_tag, &select_by_hash,
-                                 &select_files, &select_tags, &select_path_exists}) {
+                                 &select_files, &select_tags, &select_path_exists,
+                                 &fts_delete, &fts_insert, &fts_update_files}) {
             if (*s) { sqlite3_finalize(*s); *s = nullptr; }
         }
     }
@@ -180,13 +206,25 @@ Database::Database(const std::filesystem::path& db_path)
     exec(impl_->db, "PRAGMA foreign_keys = ON;");
 
     const int existing = readUserVersion(impl_->db);
-    if (existing < kSchemaVersion) {
-        exec(impl_->db, kSchemaSql);
-        writeUserVersion(impl_->db, kSchemaVersion);
-    } else if (existing > kSchemaVersion) {
+    if (existing > kSchemaVersion) {
         throw std::runtime_error(
             "database has newer schema (user_version=" + std::to_string(existing) +
             ") than this build supports (" + std::to_string(kSchemaVersion) + ")");
+    }
+
+    // v0 → v1: initial schema.
+    if (existing < 1) {
+        exec(impl_->db, kSchemaSql);
+    }
+    // v1 → v2: FTS5 index + backfill.
+    if (existing < 2) {
+        exec(impl_->db, kFtsSchemaSql);
+        if (existing >= 1) {
+            exec(impl_->db, kFtsBackfillSql);   // pre-existing disks get indexed
+        }
+    }
+    if (existing < kSchemaVersion) {
+        writeUserVersion(impl_->db, kSchemaVersion);
     }
 
     impl_->prepare(impl_->upsert_disk, R"SQL(
@@ -241,6 +279,14 @@ Database::Database(const std::filesystem::path& db_path)
 
     impl_->prepare(impl_->select_path_exists,
                    "SELECT 1 FROM disks WHERE path = ?1 LIMIT 1;");
+
+    impl_->prepare(impl_->fts_delete, "DELETE FROM disks_fts WHERE rowid = ?1;");
+    impl_->prepare(impl_->fts_insert, R"SQL(
+        INSERT INTO disks_fts (rowid, title, filename, volume_label, files)
+        VALUES (?1, ?2, ?3, ?4, '');
+    )SQL");
+    impl_->prepare(impl_->fts_update_files,
+                   "UPDATE disks_fts SET files = ?1 WHERE rowid = ?2;");
 }
 
 Database::~Database() {
@@ -313,6 +359,24 @@ void Database::upsertDisk(DiskRecord& record) {
     record.id = sqlite3_column_int64(s, 0);
     sqlite3_reset(s);
 
+    // Sync FTS row — delete + insert; files column is populated later in
+    // upsertFiles(). Virtual tables don't support ON CONFLICT.
+    sqlite3_reset(impl_->fts_delete);
+    sqlite3_bind_int64(impl_->fts_delete, 1, record.id);
+    if (sqlite3_step(impl_->fts_delete) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "fts_delete step");
+    }
+
+    sqlite3_reset(impl_->fts_insert);
+    sqlite3_clear_bindings(impl_->fts_insert);
+    sqlite3_bind_int64(impl_->fts_insert, 1, record.id);
+    bindText(impl_->fts_insert, 2, record.identified_title.value_or(""));
+    bindText(impl_->fts_insert, 3, record.filename);
+    bindText(impl_->fts_insert, 4, record.volume_label);
+    if (sqlite3_step(impl_->fts_insert) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "fts_insert step");
+    }
+
     tx.commit();
 }
 
@@ -325,6 +389,8 @@ void Database::upsertFiles(const DiskRecord& record) {
         throwSqlite(impl_->db, "delete files");
     }
 
+    std::string fts_files;
+    fts_files.reserve(record.files.size() * 16);
     for (const auto& f : record.files) {
         auto* s = impl_->insert_file;
         sqlite3_reset(s);
@@ -339,6 +405,18 @@ void Database::upsertFiles(const DiskRecord& record) {
         if (sqlite3_step(s) != SQLITE_DONE) {
             throwSqlite(impl_->db, "insert file");
         }
+
+        if (!fts_files.empty()) fts_files += ' ';
+        fts_files += f.filename;
+    }
+
+    // Patch the `files` column of the FTS row with the aggregated names.
+    sqlite3_reset(impl_->fts_update_files);
+    sqlite3_clear_bindings(impl_->fts_update_files);
+    bindText(impl_->fts_update_files, 1, fts_files);
+    sqlite3_bind_int64(impl_->fts_update_files, 2, record.id);
+    if (sqlite3_step(impl_->fts_update_files) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "fts_update_files step");
     }
 
     tx.commit();
@@ -480,6 +558,13 @@ std::vector<DiskRecord> Database::listAll() const {
 
 void Database::removeDisk(int64_t id) {
     Transaction tx(*this);
+
+    sqlite3_reset(impl_->fts_delete);
+    sqlite3_bind_int64(impl_->fts_delete, 1, id);
+    if (sqlite3_step(impl_->fts_delete) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "removeDisk fts_delete");
+    }
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(impl_->db, "DELETE FROM disks WHERE id = ?1;", -1,
                            &s, nullptr) != SQLITE_OK) {
@@ -630,26 +715,32 @@ bool Database::pathExists(const std::string& path) const {
 }
 
 std::vector<DiskRecord> Database::queryByTitle(const std::string& term) const {
-    const std::string like = "%" + term + "%";
+    // Wrap the user's term in double quotes so FTS5 treats it as a literal
+    // phrase — this keeps special characters (parentheses, colons, punctuation
+    // that TOSEC filenames contain) from being interpreted as query operators.
+    // Embedded double quotes get escaped by doubling, per FTS5 syntax rules.
+    std::string fts_term = "\"";
+    for (char c : term) {
+        if (c == '"') fts_term += '"';
+        fts_term += c;
+    }
+    fts_term += '"';
 
     sqlite3_stmt* s = nullptr;
     const char* sql = R"SQL(
-        SELECT DISTINCT d.id, d.path, d.filename, d.image_hash, d.format,
+        SELECT d.id, d.path, d.filename, d.image_hash, d.format,
                d.volume_label, d.oem_name, d.sides, d.tracks,
                d.sectors_per_track, d.bytes_per_sector,
                d.identified_title, d.publisher, d.year, d.notes
-        FROM disks d
-        LEFT JOIN files f ON f.disk_id = d.id
-        WHERE d.identified_title LIKE ?1
-           OR d.volume_label     LIKE ?1
-           OR d.filename         LIKE ?1
-           OR f.filename         LIKE ?1
-        ORDER BY d.identified_title, d.filename;
+        FROM disks_fts f
+        JOIN disks d ON d.id = f.rowid
+        WHERE disks_fts MATCH ?1
+        ORDER BY rank;
     )SQL";
     if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
         throwSqlite(impl_->db, "prepare queryByTitle");
     }
-    bindText(s, 1, like);
+    bindText(s, 1, fts_term);
 
     std::vector<DiskRecord> out;
     while (sqlite3_step(s) == SQLITE_ROW) {

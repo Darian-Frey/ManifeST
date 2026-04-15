@@ -3,7 +3,16 @@
 Single source of truth for "where we are / what's next". Update as work completes.
 Status legend: ✅ done · 🔨 in progress · ⏳ todo · ⏸ blocked · ❓ needs decision
 
-**Currently at:** Phase 6 (Linux parts + license) ✅ complete. Windows port owned by Shane on separate machine.
+**Currently at:** Phase 6 + FTS5 full-text search ✅ complete. Windows port owned by Shane.
+
+## FTS5 Full-Text Search ✅
+- [x] Schema version bumped 1 → 2, migration backfills existing rows into the new index
+- [x] `disks_fts` virtual table with **trigram** tokenizer — preserves the old `LIKE '%term%'` substring behavior
+- [x] Indexed columns: `title` · `filename` · `volume_label` · `files` (aggregated file names per disk)
+- [x] Automatic sync in `upsertDisk` / `upsertFiles` / `removeDisk` — no triggers, no orphans
+- [x] `queryByTitle` rewritten to `disks_fts MATCH ?` with phrase quoting so TOSEC punctuation can't be parsed as FTS operators; ordered by `rank`
+- [x] CMake: `SQLITE_ENABLE_FTS5` compile-define on the `sqlite3` target
+- [x] Verified: `find kan` → 2× Arkanoid (substring match), `find BANK03` → matches a file inside Another World (per-file index works), 3/3 tests still pass
 
 ---
 
@@ -193,7 +202,7 @@ Owned by Shane on a separate laptop. Not tracked here.
 
 ## Parking Lot (nice-to-have, not scheduled)
 
-- [ ] FTS5 virtual table for faster `find` across title + filenames
+- [x] FTS5 virtual table for faster `find` across title + filenames — **DONE** (see below)
 - [ ] Cover-art support if a good source ever surfaces
 - [ ] Export catalog to CSV / JSON
 - [ ] Import TOSEC DAT files directly (not just a pre-baked JSON)

@@ -29,6 +29,8 @@ set_target_properties(atari_engine PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OF
 # --- SQLite amalgamation (drop sqlite3.c / sqlite3.h into third_party/sqlite3/) ---
 add_library(sqlite3 STATIC third_party/sqlite3/sqlite3.c)
 target_include_directories(sqlite3 PUBLIC third_party/sqlite3)
+# Enable FTS5 (virtual table `disks_fts` with the trigram tokenizer).
+target_compile_definitions(sqlite3 PUBLIC SQLITE_ENABLE_FTS5)
 # Pure C; MOC/UIC/RCC would be a no-op but skip to keep the build log clean.
 set_target_properties(sqlite3 PROPERTIES AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
