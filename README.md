@@ -112,7 +112,8 @@ ctest --test-dir build --output-on-failure
 
 ## License
 
-TBD.
+[MIT](LICENSE). The vendored Atari Disk Engine subset is authored by the
+same copyright holder and distributed under the same terms.
 
 ---
 

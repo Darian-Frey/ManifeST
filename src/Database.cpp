@@ -151,6 +151,7 @@ struct Database::Impl {
     sqlite3_stmt* select_by_hash{nullptr};
     sqlite3_stmt* select_files{nullptr};
     sqlite3_stmt* select_tags{nullptr};
+    sqlite3_stmt* select_path_exists{nullptr};
 
     void prepare(sqlite3_stmt*& out, const char* sql) {
         if (sqlite3_prepare_v2(db, sql, -1, &out, nullptr) != SQLITE_OK) {
@@ -161,7 +162,7 @@ struct Database::Impl {
     void finalizeAll() {
         for (sqlite3_stmt** s : {&upsert_disk, &delete_files, &insert_file,
                                  &delete_tags, &insert_tag, &select_by_hash,
-                                 &select_files, &select_tags}) {
+                                 &select_files, &select_tags, &select_path_exists}) {
             if (*s) { sqlite3_finalize(*s); *s = nullptr; }
         }
     }
@@ -237,6 +238,9 @@ Database::Database(const std::filesystem::path& db_path)
 
     impl_->prepare(impl_->select_tags,
                    "SELECT tag FROM tags WHERE disk_id = ?1 ORDER BY tag;");
+
+    impl_->prepare(impl_->select_path_exists,
+                   "SELECT 1 FROM disks WHERE path = ?1 LIMIT 1;");
 }
 
 Database::~Database() {
@@ -425,6 +429,204 @@ std::optional<DiskRecord> Database::queryByHash(const std::string& image_hash) c
     loadFiles(impl_->select_files, r);
     loadTags (impl_->select_tags,  r);
     return r;
+}
+
+std::optional<DiskRecord> Database::queryById(int64_t id) const {
+    sqlite3_stmt* s = nullptr;
+    const char* sql = R"SQL(
+        SELECT id, path, filename, image_hash, format, volume_label, oem_name,
+               sides, tracks, sectors_per_track, bytes_per_sector,
+               identified_title, publisher, year, notes
+        FROM disks WHERE id = ?1 LIMIT 1;
+    )SQL";
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare queryById");
+    }
+    sqlite3_bind_int64(s, 1, id);
+
+    std::optional<DiskRecord> out;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        out = readDiskRow(s);
+    }
+    sqlite3_finalize(s);
+
+    if (out) {
+        loadFiles(impl_->select_files, *out);
+        loadTags (impl_->select_tags,  *out);
+    }
+    return out;
+}
+
+std::vector<DiskRecord> Database::listAll() const {
+    sqlite3_stmt* s = nullptr;
+    const char* sql = R"SQL(
+        SELECT id, path, filename, image_hash, format, volume_label, oem_name,
+               sides, tracks, sectors_per_track, bytes_per_sector,
+               identified_title, publisher, year, notes
+        FROM disks ORDER BY id;
+    )SQL";
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare listAll");
+    }
+    std::vector<DiskRecord> out;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        out.push_back(readDiskRow(s));
+    }
+    sqlite3_finalize(s);
+    // Tags are cheap and the model shows them; hydrate here.
+    for (auto& r : out) loadTags(impl_->select_tags, r);
+    return out;
+}
+
+void Database::removeDisk(int64_t id) {
+    Transaction tx(*this);
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(impl_->db, "DELETE FROM disks WHERE id = ?1;", -1,
+                           &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare removeDisk");
+    }
+    sqlite3_bind_int64(s, 1, id);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        sqlite3_finalize(s);
+        throwSqlite(impl_->db, "removeDisk step");
+    }
+    sqlite3_finalize(s);
+    tx.commit();
+}
+
+std::vector<DuplicateGroup> Database::listDuplicates() const {
+    sqlite3_stmt* s = nullptr;
+    const char* sql = R"SQL(
+        SELECT id, path, filename, image_hash, format, volume_label, oem_name,
+               sides, tracks, sectors_per_track, bytes_per_sector,
+               identified_title, publisher, year, notes
+        FROM disks
+        WHERE image_hash IN (
+            SELECT image_hash FROM disks GROUP BY image_hash HAVING COUNT(*) > 1
+        )
+        ORDER BY image_hash, filename;
+    )SQL";
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare listDuplicates");
+    }
+
+    std::vector<DuplicateGroup> groups;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        DiskRecord r = readDiskRow(s);
+        if (groups.empty() || groups.back().image_hash != r.image_hash) {
+            groups.push_back({r.image_hash, {}});
+        }
+        groups.back().disks.push_back(std::move(r));
+    }
+    sqlite3_finalize(s);
+    return groups;
+}
+
+std::vector<DiskSet> Database::listDiskSets() const {
+    sqlite3_stmt* s = nullptr;
+    const char* sql = R"SQL(
+        SELECT s.set_id, s.disk_id, s.disk_num,
+               COALESCE(d.identified_title, d.filename)
+        FROM disk_sets s
+        JOIN disks d ON d.id = s.disk_id
+        ORDER BY s.set_id, s.disk_num;
+    )SQL";
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare listDiskSets");
+    }
+
+    std::vector<DiskSet> out;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const int64_t set_id  = sqlite3_column_int64(s, 0);
+        const int64_t disk_id = sqlite3_column_int64(s, 1);
+        const int     num     = sqlite3_column_int  (s, 2);
+        const std::string title = colText(s, 3);
+
+        if (out.empty() || out.back().set_id != set_id) {
+            out.push_back({set_id, title, {}});
+        }
+        out.back().members.emplace_back(disk_id, num);
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+std::vector<TagCount> Database::listAllTags() const {
+    sqlite3_stmt* s = nullptr;
+    const char* sql = R"SQL(
+        SELECT tag, COUNT(DISTINCT disk_id)
+        FROM tags GROUP BY tag ORDER BY tag;
+    )SQL";
+    if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare listAllTags");
+    }
+
+    std::vector<TagCount> out;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        TagCount tc;
+        tc.tag   = colText(s, 0);
+        tc.count = static_cast<std::size_t>(sqlite3_column_int64(s, 1));
+        out.push_back(std::move(tc));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+std::vector<int64_t> Database::idsWithTag(const std::string& tag) const {
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(impl_->db,
+            "SELECT disk_id FROM tags WHERE tag = ?1;", -1, &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare idsWithTag");
+    }
+    bindText(s, 1, tag);
+    std::vector<int64_t> out;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        out.push_back(sqlite3_column_int64(s, 0));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+void Database::rebuildDiskSets(const std::vector<DiskSet>& sets) {
+    Transaction tx(*this);
+    exec(impl_->db, "DELETE FROM disk_sets;");
+
+    sqlite3_stmt* ins = nullptr;
+    if (sqlite3_prepare_v2(impl_->db,
+            "INSERT INTO disk_sets (set_id, disk_id, disk_num) VALUES (?1, ?2, ?3);",
+            -1, &ins, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare rebuildDiskSets");
+    }
+
+    int64_t next_id = 1;
+    for (const auto& set : sets) {
+        if (set.members.size() < 2) continue;   // don't persist singletons
+        for (const auto& [disk_id, num] : set.members) {
+            sqlite3_reset(ins);
+            sqlite3_clear_bindings(ins);
+            sqlite3_bind_int64(ins, 1, next_id);
+            sqlite3_bind_int64(ins, 2, disk_id);
+            sqlite3_bind_int  (ins, 3, num);
+            if (sqlite3_step(ins) != SQLITE_DONE) {
+                sqlite3_finalize(ins);
+                throwSqlite(impl_->db, "insert disk_set member");
+            }
+        }
+        ++next_id;
+    }
+    sqlite3_finalize(ins);
+
+    tx.commit();
+}
+
+bool Database::pathExists(const std::string& path) const {
+    auto* s = impl_->select_path_exists;
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    bindText(s, 1, path);
+    const bool found = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_reset(s);
+    return found;
 }
 
 std::vector<DiskRecord> Database::queryByTitle(const std::string& term) const {

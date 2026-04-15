@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ManifeST
+GenericName=Atari ST Disk Cataloguer
+Comment=Catalog, search, and launch Atari ST disk images
+Exec=manifest
+Icon=manifest
+Terminal=false
+Categories=Utility;Archiving;Emulator;
+Keywords=Atari;ST;disk;image;TOSEC;Hatari;

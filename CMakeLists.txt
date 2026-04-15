@@ -43,6 +43,9 @@ add_library(manifest_lib STATIC
     src/Database.cpp
     src/Scanner.cpp
     src/HatariLauncher.cpp
+    src/MultiDiskDetector.cpp
+    # Q_OBJECT headers — listed so AUTOMOC finds them.
+    include/manifest/Scanner.hpp
 )
 target_include_directories(manifest_lib PUBLIC include)
 target_link_libraries(manifest_lib
@@ -53,9 +56,15 @@ target_link_libraries(manifest_lib
 )
 
 # --- GUI library ---
+# Q_OBJECT headers are listed explicitly so AUTOMOC picks them up (they live
+# under include/, not alongside the .cpp files).
 add_library(manifest_gui STATIC
     src/gui/MainWindow.cpp
     src/gui/DiskTableModel.cpp
+    src/gui/FilterProxy.cpp
+    include/manifest/gui/MainWindow.hpp
+    include/manifest/gui/DiskTableModel.hpp
+    include/manifest/gui/FilterProxy.hpp
 )
 target_link_libraries(manifest_gui
     PUBLIC  manifest_lib
@@ -83,6 +92,14 @@ target_link_libraries(manifest
     PRIVATE manifest_gui
     PRIVATE manifest_cli
 )
+
+# --- Install / packaging (Linux) -------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS manifest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(UNIX AND NOT APPLE)
+    install(FILES packaging/manifest.desktop
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
+endif()
 
 # --- Tests ---
 enable_testing()

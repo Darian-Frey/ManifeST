@@ -3,7 +3,7 @@
 Single source of truth for "where we are / what's next". Update as work completes.
 Status legend: ✅ done · 🔨 in progress · ⏳ todo · ⏸ blocked · ❓ needs decision
 
-**Currently at:** Phase 1.2 ✅ complete → next is **Phase 1.3 · MetadataExtractor**.
+**Currently at:** Phase 6 (Linux parts + license) ✅ complete. Windows port owned by Shane on separate machine.
 
 ---
 
@@ -55,109 +55,139 @@ No GUI, no multi-disk detection yet, no CLI query shell yet — just the pipelin
 - [x] Smoke-tested against 4 real disks: Arkanoid, Another World D1 (multi-disk), Medway Boys 098 (cracker-group), Atari Language 1040ST (360K single-side)
 - [ ] Follow-up: engine's cracker-group detection returned empty for Medway Boys 098 — investigate in Phase 1.4 when wiring identification
 
-### 1.3 · `MetadataExtractor` 🔨 **← next**
-- [ ] SHA1 of raw image bytes via OpenSSL `EVP_Digest`
-- [ ] SHA1 per file (use `DiskReader` to re-read bytes)
-- [ ] `is_launcher` heuristic: single `.PRG` / `.APP` / `.TOS` in root → mark launcher
-- [ ] [tests/test_metadata.cpp](tests/test_metadata.cpp) — hash of a known fixture matches
+### 1.3 · `MetadataExtractor` ✅
+- [x] SHA1 of raw image bytes via OpenSSL `EVP_Digest` (SHA1 API deprecated in OpenSSL 3.x)
+- [x] SHA1 per file, read via `DiskReader::readFileBytes(index)`
+- [x] `is_launcher` heuristic: exactly one `.PRG` / `.APP` / `.TOS` in root
+- [x] Refactored `DiskReader` to instance-based (pimpl owns engine) so MetadataExtractor can re-read file bytes without reloading
+- [x] Added transient `FileRecord::in_root` flag (not persisted)
+- [x] [tests/test_metadata.cpp](tests/test_metadata.cpp) — 3 known SHA1 vectors (empty, "abc", "fox") + vector overload
+- [x] Smoke-verified against real disks: Arkanoid flags `ARKANOID.PRG`, Another World (no PRG) flags none
 
-### 1.4 · `Identifier`
-- [ ] Pass 1: TOSEC regex `^(.+?)\s*\((\d{4})\)\(([^)]+)\)`
-- [ ] Pass 2: volume label (≥3 chars, strip trailing spaces, `_`→space) → OEM fallback → lone-PRG fallback
-- [ ] Pass 3: optional `data/tosec_titles.json` SHA1 lookup
-- [ ] Default tag `game` on TOSEC match; tag `utility` if `[util]` flag
-- [ ] [tests/test_identifier.cpp](tests/test_identifier.cpp) — TOSEC strings, heuristic fallbacks, missing-JSON silent skip
+### 1.4 · `Identifier` ✅
+- [x] Pass 1: TOSEC regex — handles `(19xx)` placeholder (leaves year unset), case-insensitive
+- [x] Pass 2: volume label normalization (`_`→space, collapse), OEM with printable-ASCII guard, lone-launcher fallback
+- [x] Pass 3: `data/tosec_titles.json` SHA1 lookup via `QJsonDocument` (no new deps), silent skip when missing
+- [x] Orthogonal tags: `multidisk-NofM`, `cracked`, `trained`, `hacked`, `alt`, `verified`; default `game` on TOSEC match
+- [x] [tests/test_identifier.cpp](tests/test_identifier.cpp) — 8 cases: TOSEC basic / with flags+multidisk / 19xx year / label fallback / OEM-junk rejection / lone launcher / JSON hash hit / JSON missing
+- [x] Smoke-tested across 5 real disks: Arkanoid, Another World D1 (+multidisk tag), Artura (19xx), unidentified system disk, Medway Boys
 
-### 1.5 · `Scanner` (sync mode)
-- [ ] `std::filesystem::recursive_directory_iterator` filtered to `.st/.msa/.dim/.stx`
-- [ ] Pipeline per image: `DiskReader` → `MetadataExtractor` → `Identifier` → `Database::upsertDisk` (single tx per image)
-- [ ] WARN-and-continue on any image failure
-- [ ] `--incremental` flag: skip images whose hash is already in DB
-- [ ] Summary line: `N scanned, M added, K updated, J failed`
+### 1.5 · `Scanner` (sync mode) ✅
+- [x] `std::filesystem::recursive_directory_iterator` filtered to `.st/.msa/.dim/.stx` (case-insensitive)
+- [x] Pipeline per image: `DiskReader` → `MetadataExtractor` → `Identifier` → 3 upserts inside one `Database::Transaction`
+- [x] WARN-and-continue on exceptions; `failed` count incremented
+- [x] `--incremental` flag: skip by path if already present (path-based, not hash-based — see note below)
+- [x] Optional `ProgressFn` callback (CLI prints `[i/N] path`, GUI will wire signals later)
+- [x] Summary: `scanned / added / updated / skipped / failed`
+- [ ] Follow-up: hash-based incremental (new column `raw_file_sha1`) deferred until a use case arises
 
-### 1.6 · `main.cpp` CLI routing
-- [ ] Parse argv for `scan` / `query` / `launch` / `--gui` / `--db <path>` / `--incremental`
-- [ ] `scan` subcommand wires Scanner → Database and prints the summary
-- [ ] `--db` resolution: explicit path > `$MANIFEST_DB` env > `~/manifest.db`
+### 1.6 · `main.cpp` CLI routing ✅
+- [x] `manifest scan <folder> [--incremental] [--db <path>]`
+- [x] `manifest inspect <path>` (diagnostic — shows full pipeline output for one image)
+- [x] `--db` resolution: explicit flag > `$MANIFEST_DB` env > `$HOME/manifest.db` > `./manifest.db`
+- [x] `query` / `launch` still stubbed for Phase 5
 
-### Phase 1 done-when
-- [ ] `manifest scan <folder>` populates `manifest.db` without crashing on bad images
-- [ ] Volume label, OEM name, file listing, geometry, image SHA1 stored for every readable image
-- [ ] TOSEC filename parsing correctly identifies 20 known images
-- [ ] `ctest` green
-
----
-
-## Phase 2 — GUI MVP (Browse, Search, Launch) ⏳
-
-Goal: GUI opens an existing DB and lets you find / inspect / launch disks.
-No scanning from the GUI yet — Phase 3 adds that.
-
-- [ ] `HatariLauncher::launch()` — `QProcess::startDetached("hatari", {path})`, `$PATH` check, error string when absent
-- [ ] `gui::DiskTableModel` — load all rows from `Database`, `rowCount / columnCount / data / headerData`
-- [ ] `QSortFilterProxyModel` wrapped around the model for live filter + column sort
-- [ ] `gui::MainWindow`:
-  - [ ] Menu bar (File / Scan / View / Help)
-  - [ ] Toolbar with search box + clear button
-  - [ ] Central `QTableView` bound to proxy
-  - [ ] Detail dock (path, SHA1, OEM, geometry, file listing for selected row)
-  - [ ] `[ Launch in Hatari ]` button wired to `HatariLauncher`
-  - [ ] `[ Show in Files ]` button (`QDesktopServices::openUrl` on the containing folder)
-  - [ ] `View → Show Identified column` toggle (persists via `QSettings`)
-  - [ ] Right-click context menu on rows (Launch / Show Files / Copy path / Remove)
-  - [ ] `File → Open Database…`
-- [ ] Status-bar placeholder ("Ready")
-- [ ] Smoke test: open a pre-populated DB, search, sort, launch
+### Phase 1 done-when ✅
+- [x] `manifest scan <folder>` populates `manifest.db` — 44/44 disks scanned, 0 failures, 1410 files + 62 tags stored
+- [x] Volume label, OEM name, file listing, geometry, image SHA1 stored for every readable image
+- [x] TOSEC filename parsing — 42/44 identified (2 non-TOSEC system disks correctly left unidentified)
+- [x] `ctest` green — 3/3 passing
 
 ---
 
-## Phase 3 — GUI Scan Integration ⏳
+## Phase 2 — GUI MVP (Browse, Search, Launch) ✅
 
-Goal: scan from inside the GUI with a live-updating table and progress bar.
-
-- [ ] Make `Scanner` inherit `QObject`; add signals `progress(int scanned, int total, QString path)`, `imageDone(DiskRecord)`, `finished(Summary)`
-- [ ] Move Scanner onto a `QThread` owned by `MainWindow`
-- [ ] `Scan → Scan Folder…` opens `QFileDialog::getExistingDirectory`
-- [ ] Status-bar shows running progress
-- [ ] `imageDone` appends to `DiskTableModel` incrementally (no full reload)
-- [ ] Cancel button in status bar (sets a `std::atomic<bool>` the Scanner checks between images)
-- [ ] `Scan → Rescan` re-runs the last folder
-
----
-
-## Phase 4 — Advanced Identification & Grouping ⏳
-
-- [ ] Multi-disk detection pass (volume-label prefix + shared launcher SHA1)
-- [ ] `disk_sets` table populated; `multidisk-NofM` tags applied
-- [ ] GUI: `View → Multi-disk Sets` dock / tab
-- [ ] GUI: `View → Duplicates` dock / tab (same image hash, different paths)
-- [ ] GUI: tag filter sidebar (tree of `game / demo / utility / multidisk / ...`)
-
----
-
-## Phase 5 — CLI Query Shell ⏳
-
-- [ ] `cli::QueryCLI::run()` — readline loop, `manifest> ` prompt
-- [ ] Commands: `find <term>`, `list`, `info <id>`, `launch <id>`, `tags <tag>`, `dupes`, `help`, `quit`
-- [ ] `manifest query --find <term>` one-shot mode
-- [ ] `manifest launch <id>` one-shot mode
-- [ ] readline history persisted to `~/.manifest_history`
+- [x] `HatariLauncher::launch()` — `QStandardPaths::findExecutable` + `QProcess::startDetached`
+- [x] `Database` additions for the model: `listAll()`, `queryById()`, `removeDisk()`
+- [x] `gui::DiskTableModel` — 8 columns (`Id / Title / Publisher / Year / Format / VolumeLabel / Tags / Identified`), ✓/✕ for Identified, tooltip rows, row helpers `idAtRow / pathAtRow`
+- [x] `QSortFilterProxyModel` — case-insensitive filter over all columns, sortable headers
+- [x] `gui::MainWindow`:
+  - [x] Menu bar (File / View / Help) — Scan menu deferred to Phase 3
+  - [x] Toolbar: Open DB · Launch in Hatari · Show in Files · search box (clear button)
+  - [x] Central `QTableView` (sort, alternating rows, Title column stretched)
+  - [x] Bottom Details dock (rich HTML: path / SHA1 / format / label / OEM / geometry / tags / file listing with ★ for launcher)
+  - [x] `Launch in Hatari` wired to `HatariLauncher`, GUI popup on failure
+  - [x] `Show in Files` opens the containing folder via `QDesktopServices`
+  - [x] Right-click context menu: Launch / Show Files / Copy Path / Remove from Catalog (with confirm)
+  - [x] `View → Show Identified column` toggle, persisted via `QSettings`
+  - [x] Geometry + window state persisted via `QSettings`
+  - [x] Status bar shows `filtered / total` counts
+  - [ ] Follow-up: `File → Open Database…` currently stubbed — runtime DB reopen requires tearing down the model; deferred to Phase 6 polish
+- [x] CMake fix: Q_OBJECT headers under `include/` added to `manifest_gui` source list so AUTOMOC finds them
+- [x] Smoke test: `QT_QPA_PLATFORM=offscreen timeout 3 ./build/manifest --db /tmp/manifest-phase15.db` — starts, event loop runs, all 3 ctests still pass
 
 ---
 
-## Phase 6 — Polish, Packaging, Windows ⏳
+## Phase 3 — GUI Scan Integration ✅
 
-- [ ] Logging: route WARN / ERR through a single sink (`std::cerr` in CLI, `QStatusBar` + log dock in GUI)
-- [ ] `QSettings` for window geometry, last DB path, last scan folder, column visibility
-- [ ] About dialog (version, engine attribution, license)
-- [ ] Linux packaging: `.desktop` file, install target
-- [ ] **Windows port** ❓
-  - [ ] Replace `readline` with `wineditline` or a `std::getline` fallback
-  - [ ] Confirm `QProcess::startDetached("hatari", ...)` works on Windows (path to `hatari.exe`)
-  - [ ] `~/manifest.db` resolution on Windows (verify `%USERPROFILE%\manifest.db`)
-  - [ ] MSVC / MinGW build verification
-  - [ ] Installer (WiX or NSIS)
-- [ ] Choose a license (TBD — currently placeholder in README)
+- [x] `Scanner` is now a `QObject` with signals `progress(int, int, QString)` / `imageDone(DiskRecord)` / `finished(Summary)`
+- [x] `DiskRecord` + `Scanner::Summary` declared as Qt meta-types (`Q_DECLARE_METATYPE` + `qRegisterMetaType`) so they cross thread boundaries via queued signals
+- [x] `MainWindow` owns a `QThread` + `Scanner`; scans are kicked off via `startScanRequested` signal (main → worker, queued)
+- [x] `Scan → Scan Folder…` opens `QFileDialog::getExistingDirectory`, defaults to `$HOME` first time then the last folder
+- [x] Status bar shows live progress: `[i/N] filename` label + `QProgressBar` + `Cancel` button (all hidden when idle)
+- [x] `DiskTableModel::upsertRow` patches rows live — new rows `beginInsertRows` / `endInsertRows`, existing rows `dataChanged`
+- [x] `Cancel` sets `std::atomic<bool>`; the Scanner loop exits at next iteration, `finished` still fires with partial summary
+- [x] `Scan → Rescan` re-runs the last folder (path persisted via `QSettings`), full-scan mode (non-incremental)
+- [x] CLI `scan` still works — now connects to the `progress` signal via a lambda
+- [x] Destructor cancels + joins the worker thread cleanly
+
+---
+
+## Phase 4 — Advanced Identification & Grouping ✅
+
+- [x] `MultiDiskDetector` — two strategies unioned: TOSEC title + `(Disk N of M)` filename pattern, and volume-label prefix with strict 1..N validation (≤9 disks) to avoid false positives like `MEDWAY 98` + `MEDWAY 100`
+- [x] `disk_sets` table populated via `Database::rebuildDiskSets()` (full replace each pass; new `set_id` allocated from 1)
+- [x] Detector runs automatically after every scan — both CLI (`runScan`) and GUI (`onScanFinished`)
+- [x] New Database queries: `listDuplicates()`, `listDiskSets()`, `listAllTags()`, `idsWithTag()`
+- [x] New types: `DiskSet`, `DuplicateGroup`, `TagCount`
+- [x] `gui::FilterProxy` — replaces `QSortFilterProxyModel`; combines toolbar search text with an optional id whitelist
+- [x] **Unified left sidebar** (`QTreeWidget`, replaces three separate docks for cleaner UX): `All Disks (N)` · `Duplicates (N)` · `Tags` (expandable, count per tag) · `Multi-disk Sets` (expandable, members per set). Click any node → table filters
+- [x] Sidebar refreshes after scan and after manual remove
+- [x] Verified against `disks/`: 4 correct sets (Another World, Arctic Moves, Medway 099, Medway 106), 0 false positives, 0 duplicates, 7 tags surfaced
+
+---
+
+## Phase 5 — CLI Query Shell ✅
+
+- [x] `manifest::cli::QueryCLI` — interactive `manifest> ` prompt
+- [x] Commands: `find <term>`, `list`, `info <id>`, `launch <id>`, `tags`, `tags <tag>`, `dupes`, `sets`, `help`, `quit`/`exit`/`q`
+- [x] `manifest query --find <term> [--db <path>]` one-shot mode (exit 0 if matches found, 1 otherwise)
+- [x] `manifest launch <id> [--db <path>]` one-shot mode
+- [x] readline + history when `libreadline-dev` is present (`MANIFEST_HAVE_READLINE`); `std::getline` fallback otherwise — currently using fallback since readline isn't installed
+- [x] History saved to `~/.manifest_history` on exit (when readline is enabled)
+- [x] Smoke-tested: find/list/info/tags/sets/launch error path all work; 3/3 tests still pass
+
+---
+
+## Phase 6 — Polish, Packaging, Windows
+
+### Linux polish ✅
+- [x] `Version.hpp` with `kVersion` / `kProjectName` / `kAuthor` / `kEngineNote` constants
+- [x] About dialog enhanced with version, engine attribution, author, license placeholder
+- [x] `MainWindow` now owns the `Database` (via `unique_ptr`) — enables runtime reopen
+- [x] `DiskTableModel::setDatabase` + `reload()` so the model can rebind to a new DB
+- [x] File → Open Database… now actually works — tears down the worker thread, reopens DB, rebuilds model + sidebar, updates window title
+- [x] Last DB path persisted via `QSettings`; next launch reopens it automatically (explicit `--db` still wins)
+- [x] Keyboard shortcuts: Ctrl+O (open DB), Ctrl+Q (quit), Ctrl+S (scan folder), F5 (rescan), Ctrl+F (focus search), standard `QKeySequence::Find`
+- [x] Empty-state nudge in status bar when the catalog is empty
+- [x] Window title shows current DB basename
+- [ ] Follow-up: unified log sink (route CLI `fprintf(stderr)` through a single facility so a future GUI log dock can also subscribe) — deferred
+
+### Linux packaging ✅
+- [x] `packaging/manifest.desktop` — Freedesktop entry, Utility;Archiving;Emulator
+- [x] CMake `install` target: `bin/manifest` + `share/applications/manifest.desktop` via `GNUInstallDirs`
+- [x] Verified: `cmake --install build --prefix /tmp/manifest-install` produces the right tree
+- [ ] Icon file — not drawn yet; `Icon=manifest` in the .desktop resolves if one is later dropped into `share/icons/hicolor/256x256/apps/manifest.png`
+
+### Windows port ⏸
+Owned by Shane on a separate laptop. Not tracked here.
+
+### License ✅
+- [x] **MIT** — permissive, Qt-LGPL compatible, lowest-friction for a retro-hobby tool
+- [x] [LICENSE](LICENSE) file at repo root with Shane Hartley / 2026 copyright
+- [x] Note in LICENSE that the vendored engine subset is the same author, same terms
+- [x] `Version.hpp::kLicense = "MIT"` — About dialog now reads "License: MIT" instead of "TBD"
+- [x] [README.md](README.md) updated, links to LICENSE
 
 ---
 
@@ -175,8 +205,6 @@ Goal: scan from inside the GUI with a live-updating table and progress bar.
 
 ## Open Questions ❓
 
-Track questions that need a decision before the relevant phase starts.
-
-- **License** — required before first public commit.
-- **Windows CLI input** — `wineditline` vs `std::getline` fallback.
-- **DIM variants** — which DIM flavours does the vendored engine actually handle? Confirm during Phase 1.2 with a real `.DIM` fixture.
+- ~~**License**~~ — resolved: MIT.
+- **Windows CLI input** — `wineditline` vs `std::getline` fallback. (Windows port is Shane's, not tracked here.)
+- **DIM variants** — which DIM flavours does the vendored engine actually handle? Still unverified since `disks/` contains no `.DIM` fixtures. Will surface when one does.
