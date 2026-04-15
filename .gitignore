@@ -1,0 +1,94 @@
+# --- Build directories ---
+build/
+build-*/
+out/
+cmake-build-*/
+
+# --- CMake artifacts ---
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+_deps/
+compile_commands.json
+
+# --- Compiled objects / libraries / binaries ---
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# --- Dependency / preprocessed files ---
+*.d
+*.i
+*.ii
+*.gch
+*.pch
+
+# --- Debug / profiling ---
+*.dSYM/
+*.su
+*.idb
+*.pdb
+*.gcno
+*.gcda
+*.gcov
+core
+core.*
+vgcore.*
+callgrind.out.*
+massif.out.*
+perf.data
+perf.data.old
+
+# --- ManifeST runtime artifacts ---
+manifest
+manifest.db
+manifest.db-wal
+manifest.db-shm
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/tosec_titles.json
+
+# --- Third-party source drops (keep headers/checksums, ignore bulk) ---
+third_party/sqlite3/sqlite3.c
+third_party/sqlite3/sqlite3.h
+third_party/sqlite3/shell.c
+atari-disk-engine/
+
+# --- Editor / IDE ---
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+.clangd/
+.ccls-cache/
+compile_flags.txt
+.ycm_extra_conf.py
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logs / temp ---
+*.log
+*.tmp
+*.bak
+*.orig
