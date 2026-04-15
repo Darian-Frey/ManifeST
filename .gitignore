@@ -73,6 +73,9 @@ third_party/sqlite3/shell.c
 atari-disk-engine/
 disks/
 
+# Agent instructions — kept local, not part of the public repo.
+CLAUDE.md
+
 # --- Editor / IDE ---
 .vscode/
 .vs/
