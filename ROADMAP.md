@@ -5,6 +5,55 @@ Status legend: ✅ done · 🔨 in progress · ⏳ todo · ⏸ blocked · ❓ ne
 
 **Currently at:** Phase 6 + FTS5 full-text search ✅ complete. Windows port owned by Shane.
 
+## Cracker / Menu-Disk Content Catalog ✅
+- [x] Schema v2 → v3 migration adds `menu_contents(disk_id, position, game_name)` + `idx_menu_contents_game`
+- [x] `DiskRecord::menu_games` vector, persisted via `Database::upsertMenuContents`, cascade-deletes with its disk
+- [x] `MenuDiskCatalog` — loads `data/menu_disk_contents.json` shaped `{group_code: {disk_number: [games]}}`; resolves leading-zero variants (98 / 098 / 0098)
+- [x] Disk detection — three strategies in order:
+  1. Filename match (`Medway Boys Menu Disk 098 (...)`) → resolves group title → code
+  2. Volume-label prefix (`MEDWAY 98`, `PP22`) → prefix-to-code map
+  3. Engine cracker-group tag + trailing digits in label/filename
+- [x] Scanner enriches records after `Identifier` runs; GUI + CLI both plumb the catalog automatically from `data/menu_disk_contents.json`
+- [x] FTS5 integration — game names are concatenated into the indexed `files` column so `find Populous` finds the menu disk too
+- [x] GUI detail pane now shows "Games on this menu (N)" as a numbered list
+- [x] CLI `info <id>` prints the same menu-games list
+- [x] **Two input-format importers** (new `manifest import-menu <format> <file>` subcommand):
+  - `spiny` — tab-separated Medway list from https://www.spiny.org/medway/list.html (handles source's run-on-line bugs by injecting newlines before mid-line `CD<n>` tokens)
+  - `8bitchip` — HTML-table game→disks inverted index from https://atari.8bitchip.info/MenuDG.html (covers MB/PP/DB/AU/CY/FZ/SU/VE/SO/FF/GG/PK/SD/TE). Proper `<tr><td>` parser with running "current game" across continuation rows.
+- [x] Disk numbers canonicalized to stripped-leading-zeros (`032` merges with `32`)
+- [x] Strategy 3 of detection (engine cracker-group tag + any digit) removed after surfacing false positive on `Zero 5 Loader.st`
+- [x] **Seed data shipped in-repo**: `data/menu_disk_contents.json` (324 KB), 3,259 disks across 13 groups, scraped from spiny.org + 8bitchip.info with the project's own importers
+- [x] Verified on the 44-disk collection: 16 real Medway menu disks (MB098–MB106 incl. all `[a]` alts and Part A/B) correctly enriched, **0 false positives**, Zero 5 Loader correctly gets 0 games
+
+### Byte-level game detection (v4 schema) ✅
+- [x] `GameStringScanner` — extracts printable ASCII runs from `DiskReader::rawImage()` bytes (min 4, max 120 chars, skips FAT12 dirent-shaped strings), intersects against catalog's known-game corpus with **word-boundary matching** and min game length 6 to eliminate `AGE`/`ORK`/`ELF`-style noise
+- [x] `MenuDiskCatalog::allKnownGamesUpper()` — lazy-built corpus of ~4000 unique upper-cased game names drawn from every group in the catalog
+- [x] Schema v3 → v4 migration: new `detected_games(disk_id, game_name, evidence)` table
+- [x] `DiskRecord::detected_games` persisted + hydrated in `queryByHash`/`queryById`/`listAll`
+- [x] Scanner runs byte scan after catalog enrich; detected names also fold into the FTS `files` column so `find <game>` matches disks where the game is only *detected* (not catalog-listed)
+- [x] Detail pane shows two sections — **"Games on this menu — from catalog"** and **"Games detected on disk — from byte scan"** (with evidence column) — so catalog/detection agreement or discrepancy is visible
+- [x] Real-world verification:
+  - MB098 → catalog {LOTUS TURBO ESPRIT, JAMES POND}; detected {JAMES POND ✓, CORPORATION, EMPIRE} (two plausible false positives from cracktro text)
+  - MB104 (no catalog entry) → 278 game hits extracted from the disk's internal database — genuine **discovery** on an un-catalogued menu disk
+  - Arkanoid standalone → 4 hits including ARKANOID itself
+  - Another World (binary-only, no text) → 0 hits, correctly
+- [x] 3/3 unit tests still green
+- [x] **Main-table Contents column** added — `DiskTableModel::Contents`, comma-joined game list, 1-based numbered tooltip for multi-line view. `FilterProxy` search box matches against it so typing a game name in the toolbar search filters the table to the menu disk(s) containing it.
+- [x] `View → Show 'Games on this disk' column` toggle (parallel to Identified), persisted via `QSettings`, default on
+- [x] `Database::listAll()` now hydrates `menu_games` alongside `tags` so the table populates without per-row queries
+- [x] FTS5 search for games already worked at CLI: `find Lotus` → MB98, `find Mean Streets` → both parts of MB99
+
+## TOSEC DAT Import ✅
+- [x] `manifest::DatImporter` — ClrMamePro format parser (hand-rolled lexer, ~200 lines), no new deps
+- [x] Tokenises `game (...)` / `rom (...)` blocks, extracts `name` + `sha1` pairs, skips everything else
+- [x] Runs the TOSEC filename regex on each `rom.name` → writes SHA1 → `{title, publisher, year, tags}` entries into `data/tosec_titles.json`
+- [x] Merges into existing JSON (preserves entries from other imported DATs)
+- [x] New subcommand: `manifest import-dat <file.dat> [--json <output>]`
+- [x] Scanner auto-picks-up `data/tosec_titles.json` if present (both CLI and GUI); `--tosec-json <path>` overrides
+- [x] **Identifier pass reorder: SHA1 lookup now runs FIRST** — hash match is more authoritative than filename or volume-label guesses. Survives file renames, cracker rebrands, bogus labels
+- [x] End-to-end verified: renamed `Another World.ST` → `mystery-disk.st`, imported fabricated DAT entry, scan correctly identified it as "Another World · Delphine · 1991" via SHA1 alone
+- [x] Full 44-disk rescan: no regression (42/44 still identified)
+
 ## FTS5 Full-Text Search ✅
 - [x] Schema version bumped 1 → 2, migration backfills existing rows into the new index
 - [x] `disks_fts` virtual table with **trigram** tokenizer — preserves the old `LIKE '%term%'` substring behavior
@@ -202,7 +251,9 @@ Owned by Shane on a separate laptop. Not tracked here.
 
 ## Parking Lot (nice-to-have, not scheduled)
 
-- [x] FTS5 virtual table for faster `find` across title + filenames — **DONE** (see below)
+- [x] FTS5 virtual table for faster `find` across title + filenames — **DONE**
+- [x] TOSEC DAT import (hash-based identification survives file renames) — **DONE**
+- [x] Cracker / menu-disk content catalog (Medway, Pompey, D-Bug, Automation, …) — **DONE** (see below)
 - [ ] Cover-art support if a good source ever surfaces
 - [ ] Export catalog to CSV / JSON
 - [ ] Import TOSEC DAT files directly (not just a pre-baked JSON)

@@ -2,6 +2,9 @@
 #include "manifest/DiskReader.hpp"
 #include "manifest/Identifier.hpp"
 #include "manifest/MetadataExtractor.hpp"
+#include "manifest/DatImporter.hpp"
+#include "manifest/MenuDiskCatalog.hpp"
+#include "manifest/MenuImporter.hpp"
 #include "manifest/MultiDiskDetector.hpp"
 #include "manifest/QueryCLI.hpp"
 #include "manifest/HatariLauncher.hpp"
@@ -106,6 +109,69 @@ int runInspect(int argc, char** argv) {
     }
 }
 
+int runImportMenu(int argc, char** argv) {
+    // manifest import-menu <spiny|8bitchip> <input-file> [--json <out>]
+    fs::path json_path = "data/menu_disk_contents.json";
+    for (int i = 2; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], "--json") == 0) { json_path = argv[i + 1]; break; }
+    }
+    if (argc < 4) {
+        std::fprintf(stderr,
+            "usage: manifest import-menu <spiny|8bitchip> <input> [--json <out>]\n");
+        return 2;
+    }
+    const std::string fmt_arg = argv[2];
+    manifest::MenuImporter::Format fmt;
+    if      (fmt_arg == "spiny")    fmt = manifest::MenuImporter::Format::Spiny;
+    else if (fmt_arg == "8bitchip") fmt = manifest::MenuImporter::Format::Bitchip;
+    else {
+        std::fprintf(stderr, "unknown format '%s' (expected spiny or 8bitchip)\n",
+                     fmt_arg.c_str());
+        return 2;
+    }
+
+    try {
+        const fs::path input = argv[3];
+        std::printf("Parsing %s (%s format)\n", input.string().c_str(), fmt_arg.c_str());
+        const auto s = manifest::MenuImporter::importFile(fmt, input, json_path);
+        std::printf("%zu lines read, %zu disk entries, %zu games, %zu skipped\n",
+                    s.lines_read, s.disks_touched, s.games_total, s.skipped);
+        std::printf("wrote %s\n", json_path.string().c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "import-menu failed: %s\n", e.what());
+        return 1;
+    }
+}
+
+int runImportDat(int argc, char** argv) {
+    // Optional: --json <output-path>
+    fs::path json_path = "data/tosec_titles.json";
+    for (int i = 2; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], "--json") == 0) { json_path = argv[i + 1]; break; }
+    }
+
+    if (argc < 3) {
+        std::fprintf(stderr,
+            "usage: manifest import-dat <dat-path> [--json <output>]\n");
+        return 2;
+    }
+
+    try {
+        const fs::path dat_path = argv[2];
+        std::printf("Parsing %s\n", dat_path.string().c_str());
+        const auto s = manifest::DatImporter::importDat(dat_path, json_path);
+        std::printf("%zu rom entries, %zu imported (%zu overwrote existing), "
+                    "%zu skipped (no TOSEC name)\n",
+                    s.rom_entries, s.imported, s.overwritten, s.skipped);
+        std::printf("wrote %s\n", json_path.string().c_str());
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "import-dat failed: %s\n", e.what());
+        return 1;
+    }
+}
+
 int runQuery(int argc, char** argv) {
     const fs::path db_path = parseDbFlag(argc, argv, 2);
 
@@ -161,10 +227,32 @@ int runScan(int argc, char** argv) {
     }
     const fs::path root = argv[2];
 
+    // Optional: --tosec-json <path>; default to data/tosec_titles.json if present.
+    fs::path tosec_json = "data/tosec_titles.json";
+    for (int i = 2; i < argc - 1; ++i) {
+        if (std::strcmp(argv[i], "--tosec-json") == 0) { tosec_json = argv[i + 1]; break; }
+    }
+    std::optional<fs::path> tosec_opt;
+    if (fs::exists(tosec_json)) {
+        tosec_opt = tosec_json;
+        std::printf("Using TOSEC hash DB: %s\n", tosec_json.string().c_str());
+    }
+
+    // Optional: menu-disk catalog at data/menu_disk_contents.json.
+    const fs::path menu_json = "data/menu_disk_contents.json";
+    manifest::MenuDiskCatalog menu_catalog;
+    if (fs::exists(menu_json)) {
+        menu_catalog = manifest::MenuDiskCatalog(menu_json);
+        if (menu_catalog.loaded()) {
+            std::printf("Using menu-disk catalog: %s\n", menu_json.string().c_str());
+        }
+    }
+
     try {
         manifest::Database   db(db_path);
-        manifest::Identifier identifier;
+        manifest::Identifier identifier(tosec_opt);
         manifest::Scanner    scanner(db, identifier);
+        if (menu_catalog.loaded()) scanner.setMenuCatalog(&menu_catalog);
 
         QObject::connect(&scanner, &manifest::Scanner::progress,
             [](int i, int n, const QString& path) {
@@ -194,10 +282,12 @@ int runScan(int argc, char** argv) {
 //   manifest query ...           → readline query shell (phase 5)
 //   manifest launch <id> ...     → one-shot Hatari launch (phase 5)
 int main(int argc, char** argv) {
-    if (argc > 1 && std::strcmp(argv[1], "inspect") == 0) return runInspect(argc, argv);
-    if (argc > 1 && std::strcmp(argv[1], "scan")    == 0) return runScan(argc, argv);
-    if (argc > 1 && std::strcmp(argv[1], "query")   == 0) return runQuery(argc, argv);
-    if (argc > 1 && std::strcmp(argv[1], "launch")  == 0) return runLaunch(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "inspect")    == 0) return runInspect(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "scan")       == 0) return runScan(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "query")      == 0) return runQuery(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "launch")     == 0) return runLaunch(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "import-dat")  == 0) return runImportDat(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "import-menu") == 0) return runImportMenu(argc, argv);
 
     // --- GUI ----------------------------------------------------------------
     // Pull --db out of argv before handing it to QApplication.

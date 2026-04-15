@@ -154,7 +154,21 @@ void Identifier::identify(DiskRecord& record) const {
     if (auto md = parseDiskSet(record.filename)) addTag(record.tags, *md);
     parseFlags(record.filename, record.tags);
 
-    // --- Pass 1 · TOSEC filename ---------------------------------------
+    // --- Pass 1 · SHA1 lookup (most authoritative) ---------------------
+    // Hash match wins over everything else — it's the one data source that
+    // survives filename changes, cracker rebrands, and bogus volume labels.
+    if (!impl_->by_hash.empty() && !record.image_hash.empty()) {
+        auto it = impl_->by_hash.find(record.image_hash);
+        if (it != impl_->by_hash.end()) {
+            record.identified_title = it->second.title;
+            if (it->second.publisher) record.publisher = it->second.publisher;
+            if (it->second.year)      record.year      = it->second.year;
+            for (const auto& t : it->second.tags) addTag(record.tags, t);
+            return;
+        }
+    }
+
+    // --- Pass 2 · TOSEC filename ---------------------------------------
     std::string title;
     std::optional<int>         year;
     std::optional<std::string> publisher;
@@ -162,14 +176,13 @@ void Identifier::identify(DiskRecord& record) const {
         record.identified_title = title;
         if (year)      record.year      = year;
         if (publisher) record.publisher = publisher;
-        // Default to "game" unless already tagged as utility via flags.
         bool is_util = std::find(record.tags.begin(), record.tags.end(), "utility")
                        != record.tags.end();
         if (!is_util) addTag(record.tags, "game");
         return;
     }
 
-    // --- Pass 2 · Heuristics -------------------------------------------
+    // --- Pass 3 · Heuristics -------------------------------------------
     const std::string label = normalizeLabel(record.volume_label);
     if (label.size() >= 3) {
         record.identified_title = label;
@@ -178,8 +191,6 @@ void Identifier::identify(DiskRecord& record) const {
 
     const std::string oem = trim(record.oem_name);
     if (oem.size() >= 3) {
-        // OEM is often junk (e.g. "NNNNNNÁë") — require it to look
-        // mostly-printable before accepting.
         const bool printable = std::all_of(oem.begin(), oem.end(),
             [](char c){ return c >= 32 && c < 127; });
         if (printable) {
@@ -188,22 +199,10 @@ void Identifier::identify(DiskRecord& record) const {
         }
     }
 
-    // Lone launcher in root → filename sans extension.
     for (const auto& f : record.files) {
         if (f.is_launcher) {
             record.identified_title = stripExtension(f.filename);
             return;
-        }
-    }
-
-    // --- Pass 3 · JSON SHA1 lookup -------------------------------------
-    if (!impl_->by_hash.empty() && !record.image_hash.empty()) {
-        auto it = impl_->by_hash.find(record.image_hash);
-        if (it != impl_->by_hash.end()) {
-            record.identified_title = it->second.title;
-            if (it->second.publisher) record.publisher = it->second.publisher;
-            if (it->second.year)      record.year      = it->second.year;
-            for (const auto& t : it->second.tags) addTag(record.tags, t);
         }
     }
 }

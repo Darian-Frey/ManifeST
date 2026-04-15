@@ -10,7 +10,7 @@ namespace manifest {
 
 namespace {
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 4;
 
 // Full-text-search index applied at user_version 2. Trigram tokenizer gives
 // substring matching, so `find ark` still hits "Arkanoid" the way the
@@ -32,6 +32,32 @@ SELECT d.id,
        COALESCE((SELECT GROUP_CONCAT(f.filename, ' ')
                  FROM files f WHERE f.disk_id = d.id), '')
 FROM disks d;
+)SQL";
+
+// Applied on migration 2 → 3. Adds the menu-disk contents table used by
+// MenuDiskCatalog to record the games sitting on a Medway / Pompey / D-Bug
+// / Automation menu disk.
+constexpr const char* kMenuContentsSql = R"SQL(
+CREATE TABLE IF NOT EXISTS menu_contents (
+    disk_id   INTEGER NOT NULL REFERENCES disks(id) ON DELETE CASCADE,
+    position  INTEGER NOT NULL,
+    game_name TEXT    NOT NULL,
+    PRIMARY KEY (disk_id, position)
+);
+CREATE INDEX IF NOT EXISTS idx_menu_contents_game ON menu_contents(game_name);
+)SQL";
+
+// Applied on migration 3 → 4: games detected by byte-level string
+// scanning against the known-games corpus. Separate from menu_contents
+// because the source is empirical (fuzzy) rather than authoritative.
+constexpr const char* kDetectedGamesSql = R"SQL(
+CREATE TABLE IF NOT EXISTS detected_games (
+    disk_id   INTEGER NOT NULL REFERENCES disks(id) ON DELETE CASCADE,
+    game_name TEXT    NOT NULL,
+    evidence  TEXT,
+    PRIMARY KEY (disk_id, game_name)
+);
+CREATE INDEX IF NOT EXISTS idx_detected_games_name ON detected_games(game_name);
 )SQL";
 
 constexpr const char* kSchemaSql = R"SQL(
@@ -177,6 +203,12 @@ struct Database::Impl {
     sqlite3_stmt* fts_delete{nullptr};
     sqlite3_stmt* fts_insert{nullptr};
     sqlite3_stmt* fts_update_files{nullptr};
+    sqlite3_stmt* menu_delete{nullptr};
+    sqlite3_stmt* menu_insert{nullptr};
+    sqlite3_stmt* menu_select{nullptr};
+    sqlite3_stmt* detected_delete{nullptr};
+    sqlite3_stmt* detected_insert{nullptr};
+    sqlite3_stmt* detected_select{nullptr};
 
     void prepare(sqlite3_stmt*& out, const char* sql) {
         if (sqlite3_prepare_v2(db, sql, -1, &out, nullptr) != SQLITE_OK) {
@@ -188,7 +220,9 @@ struct Database::Impl {
         for (sqlite3_stmt** s : {&upsert_disk, &delete_files, &insert_file,
                                  &delete_tags, &insert_tag, &select_by_hash,
                                  &select_files, &select_tags, &select_path_exists,
-                                 &fts_delete, &fts_insert, &fts_update_files}) {
+                                 &fts_delete, &fts_insert, &fts_update_files,
+                                 &menu_delete, &menu_insert, &menu_select,
+                                 &detected_delete, &detected_insert, &detected_select}) {
             if (*s) { sqlite3_finalize(*s); *s = nullptr; }
         }
     }
@@ -222,6 +256,14 @@ Database::Database(const std::filesystem::path& db_path)
         if (existing >= 1) {
             exec(impl_->db, kFtsBackfillSql);   // pre-existing disks get indexed
         }
+    }
+    // v2 → v3: menu_contents table for cracker/menu disk game listings.
+    if (existing < 3) {
+        exec(impl_->db, kMenuContentsSql);
+    }
+    // v3 → v4: detected_games table populated by GameStringScanner.
+    if (existing < 4) {
+        exec(impl_->db, kDetectedGamesSql);
     }
     if (existing < kSchemaVersion) {
         writeUserVersion(impl_->db, kSchemaVersion);
@@ -287,6 +329,25 @@ Database::Database(const std::filesystem::path& db_path)
     )SQL");
     impl_->prepare(impl_->fts_update_files,
                    "UPDATE disks_fts SET files = ?1 WHERE rowid = ?2;");
+
+    impl_->prepare(impl_->menu_delete, "DELETE FROM menu_contents WHERE disk_id = ?1;");
+    impl_->prepare(impl_->menu_insert, R"SQL(
+        INSERT INTO menu_contents (disk_id, position, game_name) VALUES (?1, ?2, ?3);
+    )SQL");
+    impl_->prepare(impl_->menu_select, R"SQL(
+        SELECT position, game_name FROM menu_contents
+        WHERE disk_id = ?1 ORDER BY position;
+    )SQL");
+
+    impl_->prepare(impl_->detected_delete,
+                   "DELETE FROM detected_games WHERE disk_id = ?1;");
+    impl_->prepare(impl_->detected_insert, R"SQL(
+        INSERT INTO detected_games (disk_id, game_name, evidence) VALUES (?1, ?2, ?3);
+    )SQL");
+    impl_->prepare(impl_->detected_select, R"SQL(
+        SELECT game_name, evidence FROM detected_games
+        WHERE disk_id = ?1 ORDER BY game_name;
+    )SQL");
 }
 
 Database::~Database() {
@@ -390,7 +451,20 @@ void Database::upsertFiles(const DiskRecord& record) {
     }
 
     std::string fts_files;
-    fts_files.reserve(record.files.size() * 16);
+    fts_files.reserve(record.files.size() * 16
+                    + record.menu_games.size() * 16
+                    + record.detected_games.size() * 16);
+    // Menu-disk game titles are indexed alongside raw filenames so
+    // `find Populous` hits any menu disk known to contain Populous
+    // (via either the curated catalog OR the byte-level string scan).
+    for (const auto& g : record.menu_games) {
+        if (!fts_files.empty()) fts_files += ' ';
+        fts_files += g.name;
+    }
+    for (const auto& g : record.detected_games) {
+        if (!fts_files.empty()) fts_files += ' ';
+        fts_files += g.name;
+    }
     for (const auto& f : record.files) {
         auto* s = impl_->insert_file;
         sqlite3_reset(s);
@@ -419,6 +493,52 @@ void Database::upsertFiles(const DiskRecord& record) {
         throwSqlite(impl_->db, "fts_update_files step");
     }
 
+    tx.commit();
+}
+
+void Database::upsertMenuContents(const DiskRecord& record) {
+    Transaction tx(*this);
+
+    sqlite3_reset(impl_->menu_delete);
+    sqlite3_bind_int64(impl_->menu_delete, 1, record.id);
+    if (sqlite3_step(impl_->menu_delete) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "delete menu_contents");
+    }
+
+    for (const auto& g : record.menu_games) {
+        auto* s = impl_->menu_insert;
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+        sqlite3_bind_int64(s, 1, record.id);
+        sqlite3_bind_int  (s, 2, g.position);
+        bindText          (s, 3, g.name);
+        if (sqlite3_step(s) != SQLITE_DONE) {
+            throwSqlite(impl_->db, "insert menu_contents");
+        }
+    }
+    tx.commit();
+}
+
+void Database::upsertDetectedGames(const DiskRecord& record) {
+    Transaction tx(*this);
+
+    sqlite3_reset(impl_->detected_delete);
+    sqlite3_bind_int64(impl_->detected_delete, 1, record.id);
+    if (sqlite3_step(impl_->detected_delete) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "delete detected_games");
+    }
+
+    for (const auto& d : record.detected_games) {
+        auto* s = impl_->detected_insert;
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+        sqlite3_bind_int64(s, 1, record.id);
+        bindText          (s, 2, d.name);
+        bindTextOrNull    (s, 3, d.evidence);
+        if (sqlite3_step(s) != SQLITE_DONE) {
+            throwSqlite(impl_->db, "insert detected_game");
+        }
+    }
     tx.commit();
 }
 
@@ -471,6 +591,28 @@ void loadTags(sqlite3_stmt* stmt, DiskRecord& rec) {
     }
 }
 
+void loadMenuGames(sqlite3_stmt* stmt, DiskRecord& rec) {
+    sqlite3_reset(stmt);
+    sqlite3_bind_int64(stmt, 1, rec.id);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        MenuGame g;
+        g.position = sqlite3_column_int(stmt, 0);
+        g.name     = colText(stmt, 1);
+        rec.menu_games.push_back(std::move(g));
+    }
+}
+
+void loadDetectedGames(sqlite3_stmt* stmt, DiskRecord& rec) {
+    sqlite3_reset(stmt);
+    sqlite3_bind_int64(stmt, 1, rec.id);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        DetectedGame d;
+        d.name     = colText(stmt, 0);
+        d.evidence = colText(stmt, 1);
+        rec.detected_games.push_back(std::move(d));
+    }
+}
+
 DiskRecord readDiskRow(sqlite3_stmt* s) {
     DiskRecord r;
     r.id                = sqlite3_column_int64(s, 0);
@@ -504,8 +646,10 @@ std::optional<DiskRecord> Database::queryByHash(const std::string& image_hash) c
     DiskRecord r = readDiskRow(s);
     sqlite3_reset(s);
 
-    loadFiles(impl_->select_files, r);
-    loadTags (impl_->select_tags,  r);
+    loadFiles        (impl_->select_files,     r);
+    loadTags         (impl_->select_tags,      r);
+    loadMenuGames    (impl_->menu_select,      r);
+    loadDetectedGames(impl_->detected_select,  r);
     return r;
 }
 
@@ -529,8 +673,10 @@ std::optional<DiskRecord> Database::queryById(int64_t id) const {
     sqlite3_finalize(s);
 
     if (out) {
-        loadFiles(impl_->select_files, *out);
-        loadTags (impl_->select_tags,  *out);
+        loadFiles        (impl_->select_files,    *out);
+        loadTags         (impl_->select_tags,     *out);
+        loadMenuGames    (impl_->menu_select,     *out);
+        loadDetectedGames(impl_->detected_select, *out);
     }
     return out;
 }
@@ -551,8 +697,12 @@ std::vector<DiskRecord> Database::listAll() const {
         out.push_back(readDiskRow(s));
     }
     sqlite3_finalize(s);
-    // Tags are cheap and the model shows them; hydrate here.
-    for (auto& r : out) loadTags(impl_->select_tags, r);
+    // Tags, menu games, and detected games are all shown in the GUI.
+    for (auto& r : out) {
+        loadTags         (impl_->select_tags,     r);
+        loadMenuGames    (impl_->menu_select,     r);
+        loadDetectedGames(impl_->detected_select, r);
+    }
     return out;
 }
 

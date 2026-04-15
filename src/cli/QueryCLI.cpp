@@ -116,6 +116,12 @@ void printInfo(const DiskRecord& r) {
         for (const auto& t : r.tags) std::printf(" %s", t.c_str());
         std::puts("");
     }
+    if (!r.menu_games.empty()) {
+        std::printf("menu games (%zu):\n", r.menu_games.size());
+        for (const auto& g : r.menu_games) {
+            std::printf("  %2d. %s\n", g.position + 1, g.name.c_str());
+        }
+    }
     if (!r.files.empty()) {
         std::printf("files (%zu):\n", r.files.size());
         for (const auto& f : r.files) {

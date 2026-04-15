@@ -16,6 +16,13 @@ QString joinTags(const std::vector<std::string>& tags) {
     return out.join(", ");
 }
 
+QString joinMenuGames(const std::vector<manifest::MenuGame>& games) {
+    QStringList out;
+    out.reserve(static_cast<int>(games.size()));
+    for (const auto& g : games) out << QString::fromStdString(g.name);
+    return out.join(", ");
+}
+
 QString optString(const std::optional<std::string>& v) {
     return v ? QString::fromStdString(*v) : QString{};
 }
@@ -50,6 +57,7 @@ QVariant DiskTableModel::data(const QModelIndex& index, int role) const {
             case Format:      return QString::fromStdString(r.format);
             case VolumeLabel: return QString::fromStdString(r.volume_label);
             case Tags:        return joinTags(r.tags);
+            case Contents:    return joinMenuGames(r.menu_games);
             case Identified:  return r.identified_title.has_value()
                                   ? QStringLiteral("\u2713")    // ✓
                                   : QStringLiteral("\u2717");   // ✕
@@ -73,6 +81,16 @@ QVariant DiskTableModel::data(const QModelIndex& index, int role) const {
                 ? QStringLiteral("Identified")
                 : QStringLiteral("Not identified — no TOSEC name, volume label, or hash match");
         }
+        if (index.column() == Contents && !r.menu_games.empty()) {
+            // Multi-line numbered list in the tooltip — easier to scan.
+            QStringList lines;
+            for (std::size_t i = 0; i < r.menu_games.size(); ++i) {
+                lines << QStringLiteral("%1. %2")
+                    .arg(i + 1)
+                    .arg(QString::fromStdString(r.menu_games[i].name));
+            }
+            return lines.join('\n');
+        }
         return QString::fromStdString(r.path);
     }
 
@@ -91,6 +109,7 @@ QVariant DiskTableModel::headerData(int section, Qt::Orientation orientation, in
         case Format:      return QStringLiteral("Format");
         case VolumeLabel: return QStringLiteral("Volume Label");
         case Tags:        return QStringLiteral("Tags");
+        case Contents:    return QStringLiteral("Games on this disk");
         case Identified:  return QStringLiteral("Identified?");
     }
     return {};

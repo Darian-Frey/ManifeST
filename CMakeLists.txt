@@ -46,6 +46,10 @@ add_library(manifest_lib STATIC
     src/Scanner.cpp
     src/HatariLauncher.cpp
     src/MultiDiskDetector.cpp
+    src/DatImporter.cpp
+    src/MenuDiskCatalog.cpp
+    src/MenuImporter.cpp
+    src/GameStringScanner.cpp
     # Q_OBJECT headers — listed so AUTOMOC finds them.
     include/manifest/Scanner.hpp
 )

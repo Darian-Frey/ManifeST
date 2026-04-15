@@ -2,7 +2,9 @@
 
 #include "manifest/Database.hpp"
 #include "manifest/DiskReader.hpp"
+#include "manifest/GameStringScanner.hpp"
 #include "manifest/Identifier.hpp"
+#include "manifest/MenuDiskCatalog.hpp"
 #include "manifest/MetadataExtractor.hpp"
 
 #include <algorithm>
@@ -84,12 +86,24 @@ Scanner::Summary Scanner::scan(const std::filesystem::path& root, bool increment
             DiskRecord rec = reader.takeRecord();
             MetadataExtractor::enrich(reader, rec);
             identifier_.identify(rec);
+            if (menu_catalog_) {
+                menu_catalog_->enrich(rec);
+                // Byte-level game detection: match printable ASCII runs in
+                // the raw image against the catalog's known-games corpus.
+                // Runs independently of the catalog hit — useful for cross
+                // -checking (agreement with curated list) and for finding
+                // games on un-catalogued disks.
+                rec.detected_games = GameStringScanner::scan(
+                    reader.rawImage(), menu_catalog_->allKnownGamesUpper());
+            }
 
             {
                 Database::Transaction tx(db_);
                 db_.upsertDisk(rec);
                 db_.upsertFiles(rec);
                 db_.upsertTags(rec);
+                db_.upsertMenuContents(rec);
+                db_.upsertDetectedGames(rec);
                 tx.commit();
             }
 

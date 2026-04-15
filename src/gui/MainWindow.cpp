@@ -3,6 +3,7 @@
 #include "manifest/Database.hpp"
 #include "manifest/HatariLauncher.hpp"
 #include "manifest/Identifier.hpp"
+#include "manifest/MenuDiskCatalog.hpp"
 #include "manifest/MultiDiskDetector.hpp"
 #include "manifest/Scanner.hpp"
 #include "manifest/Version.hpp"
@@ -44,7 +45,8 @@ constexpr const char* kSettingsOrg  = "ManifeST";
 constexpr const char* kSettingsApp  = "ManifeST";
 constexpr const char* kKeyGeometry  = "mainwindow/geometry";
 constexpr const char* kKeyState     = "mainwindow/state";
-constexpr const char* kKeyShowIdent = "view/show_identified";
+constexpr const char* kKeyShowIdent    = "view/show_identified";
+constexpr const char* kKeyShowContents = "view/show_contents";
 constexpr const char* kKeyLastScan  = "scan/last_root";
 constexpr const char* kKeyLastDb    = "db/last_path";
 
@@ -60,7 +62,19 @@ MainWindow::MainWindow(const QString& db_path, QWidget* parent)
 
     dbPath_     = db_path;
     db_         = std::make_unique<Database>(db_path.toStdString());
-    identifier_ = std::make_unique<Identifier>();
+
+    // Pick up data/tosec_titles.json if it's sitting alongside the binary
+    // (either the source checkout layout or the installed location).
+    std::optional<std::filesystem::path> tosec_json;
+    const std::filesystem::path candidate = "data/tosec_titles.json";
+    if (std::filesystem::exists(candidate)) tosec_json = candidate;
+    identifier_ = std::make_unique<Identifier>(tosec_json);
+
+    // Menu-disk catalog (Medway / Pompey / D-Bug / …) if present.
+    const std::filesystem::path menu_json = "data/menu_disk_contents.json";
+    if (std::filesystem::exists(menu_json)) {
+        menu_catalog_ = std::make_unique<MenuDiskCatalog>(menu_json);
+    }
 
     setWindowTitle(QStringLiteral("ManifeST — %1").arg(QFileInfo(dbPath_).fileName()));
 
@@ -133,9 +147,24 @@ void MainWindow::buildUi() {
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     table_->setContextMenuPolicy(Qt::CustomContextMenu);
     table_->verticalHeader()->setVisible(false);
-    table_->horizontalHeader()->setStretchLastSection(false);
-    table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
-    table_->horizontalHeader()->setSectionResizeMode(DiskTableModel::Title, QHeaderView::Stretch);
+
+    // All columns resize independently — no Stretch mode (which would make
+    // one column absorb/release width whenever any other column was
+    // resized, causing the "opposite side moves" behavior). Sensible
+    // default widths; user can resize any of them freely.
+    auto* hh = table_->horizontalHeader();
+    hh->setSectionResizeMode(QHeaderView::Interactive);
+    hh->setStretchLastSection(false);
+    hh->resizeSection(DiskTableModel::Id,          60);
+    hh->resizeSection(DiskTableModel::Title,       260);
+    hh->resizeSection(DiskTableModel::Publisher,   160);
+    hh->resizeSection(DiskTableModel::Year,        60);
+    hh->resizeSection(DiskTableModel::Format,      70);
+    hh->resizeSection(DiskTableModel::VolumeLabel, 120);
+    hh->resizeSection(DiskTableModel::Tags,        160);
+    hh->resizeSection(DiskTableModel::Contents,    320);
+    hh->resizeSection(DiskTableModel::Identified,  90);
+
     table_->sortByColumn(DiskTableModel::Title, Qt::AscendingOrder);
     setCentralWidget(table_);
 
@@ -207,6 +236,12 @@ void MainWindow::buildMenus() {
     actToggleIdentified_->setChecked(true);
     connect(actToggleIdentified_, &QAction::toggled,
             this, &MainWindow::onToggleIdentifiedColumn);
+
+    actToggleContents_ = mView->addAction(QStringLiteral("Show 'Games on this disk' column"));
+    actToggleContents_->setCheckable(true);
+    actToggleContents_->setChecked(true);
+    connect(actToggleContents_, &QAction::toggled,
+            this, &MainWindow::onToggleContentsColumn);
 
     auto* mHelp = menuBar()->addMenu(QStringLiteral("&Help"));
     auto* actAbout = mHelp->addAction(QStringLiteral("About ManifeST"));
@@ -381,6 +416,9 @@ void MainWindow::buildStatusBar() {
 void MainWindow::buildScannerThread() {
     scanThread_ = new QThread(this);
     scanner_    = new Scanner(*db_, *identifier_);   // no parent — moved to thread
+    if (menu_catalog_ && menu_catalog_->loaded()) {
+        scanner_->setMenuCatalog(menu_catalog_.get());
+    }
     scanner_->moveToThread(scanThread_);
 
     // We drive scans by emitting startScanRequested — the scanner performs
@@ -455,6 +493,26 @@ void MainWindow::onSelectionChanged() {
         row(QStringLiteral("Tags"), t.join(", "));
     }
     html += QStringLiteral("</table>");
+
+    if (!r.menu_games.empty()) {
+        html += QStringLiteral("<h4>Games on this menu — from catalog (%1)</h4><ol>")
+                    .arg(r.menu_games.size());
+        for (const auto& g : r.menu_games) {
+            html += QStringLiteral("<li>%1</li>").arg(htmlEscape(g.name));
+        }
+        html += QStringLiteral("</ol>");
+    }
+
+    if (!r.detected_games.empty()) {
+        html += QStringLiteral("<h4>Games detected on disk — from byte scan (%1)</h4>"
+                               "<table cellpadding='2'>")
+                    .arg(r.detected_games.size());
+        for (const auto& g : r.detected_games) {
+            html += QStringLiteral("<tr><td>%1</td><td><tt>%2</tt></td></tr>")
+                .arg(htmlEscape(g.name), htmlEscape(g.evidence));
+        }
+        html += QStringLiteral("</table>");
+    }
 
     html += QStringLiteral("<h4>Files (%1)</h4><table cellpadding='2'>").arg(r.files.size());
     for (const auto& f : r.files) {
@@ -546,6 +604,10 @@ void MainWindow::onToggleIdentifiedColumn(bool visible) {
     table_->setColumnHidden(DiskTableModel::Identified, !visible);
 }
 
+void MainWindow::onToggleContentsColumn(bool visible) {
+    table_->setColumnHidden(DiskTableModel::Contents, !visible);
+}
+
 // --- Scanning --------------------------------------------------------------
 
 void MainWindow::setScanUiRunning(bool running) {
@@ -623,6 +685,11 @@ void MainWindow::restoreSettings() {
     const bool show_ident = s.value(kKeyShowIdent, true).toBool();
     actToggleIdentified_->setChecked(show_ident);
     table_->setColumnHidden(DiskTableModel::Identified, !show_ident);
+
+    const bool show_contents = s.value(kKeyShowContents, true).toBool();
+    actToggleContents_->setChecked(show_contents);
+    table_->setColumnHidden(DiskTableModel::Contents, !show_contents);
+
     lastScanRoot_ = s.value(kKeyLastScan).toString();
     actRescan_->setEnabled(!lastScanRoot_.isEmpty());
 }
@@ -631,7 +698,8 @@ void MainWindow::saveSettings() {
     QSettings s(kSettingsOrg, kSettingsApp);
     s.setValue(kKeyGeometry,  saveGeometry());
     s.setValue(kKeyState,     saveState());
-    s.setValue(kKeyShowIdent, actToggleIdentified_->isChecked());
+    s.setValue(kKeyShowIdent,    actToggleIdentified_->isChecked());
+    s.setValue(kKeyShowContents, actToggleContents_->isChecked());
     s.setValue(kKeyLastScan,  lastScanRoot_);
     s.setValue(kKeyLastDb,    dbPath_);
 }
