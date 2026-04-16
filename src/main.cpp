@@ -3,8 +3,10 @@
 #include "manifest/Identifier.hpp"
 #include "manifest/MetadataExtractor.hpp"
 #include "manifest/DatImporter.hpp"
+#include "manifest/Exporter.hpp"
 #include "manifest/MenuDiskCatalog.hpp"
 #include "manifest/MenuImporter.hpp"
+#include "manifest/ScreenScraperCache.hpp"
 #include "manifest/MultiDiskDetector.hpp"
 #include "manifest/QueryCLI.hpp"
 #include "manifest/HatariLauncher.hpp"
@@ -24,6 +26,8 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <optional>
 #include <string>
 
@@ -105,6 +109,53 @@ int runInspect(int argc, char** argv) {
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "inspect failed: %s\n", e.what());
+        return 1;
+    }
+}
+
+int runExport(int argc, char** argv) {
+    fs::path    db_path = defaultDbPath();
+    fs::path    out_path;
+    std::string fmt_arg = "csv";
+
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        if      (a == "--db"     && i + 1 < argc) { db_path = argv[++i]; }
+        else if (a == "--format" && i + 1 < argc) { fmt_arg = argv[++i]; }
+        else if (a == "-o"       && i + 1 < argc) { out_path = argv[++i]; }
+        else {
+            std::fprintf(stderr,
+                "usage: manifest export [--format csv|json|m3u] "
+                "[--db <path>] [-o <file>]\n");
+            return 2;
+        }
+    }
+
+    manifest::Exporter::Format fmt;
+    if      (fmt_arg == "csv")  fmt = manifest::Exporter::Format::Csv;
+    else if (fmt_arg == "json") fmt = manifest::Exporter::Format::Json;
+    else if (fmt_arg == "m3u")  fmt = manifest::Exporter::Format::M3u;
+    else {
+        std::fprintf(stderr, "unknown format '%s' (expected csv|json|m3u)\n", fmt_arg.c_str());
+        return 2;
+    }
+
+    try {
+        manifest::Database db(db_path);
+        if (out_path.empty()) {
+            manifest::Exporter::exportTo(db, fmt, std::cout);
+        } else {
+            std::ofstream f(out_path, std::ios::binary);
+            if (!f) {
+                std::fprintf(stderr, "cannot write %s\n", out_path.string().c_str());
+                return 1;
+            }
+            manifest::Exporter::exportTo(db, fmt, f);
+            std::fprintf(stderr, "wrote %s\n", out_path.string().c_str());
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "export failed: %s\n", e.what());
         return 1;
     }
 }
@@ -218,11 +269,13 @@ int runLaunch(int argc, char** argv) {
 
 int runScan(int argc, char** argv) {
     const bool incremental = takeFlag(argc, argv, 2, "--incremental");
+    const bool quick       = takeFlag(argc, argv, 2, "--quick");
     const fs::path db_path = parseDbFlag(argc, argv, 2);
 
     if (argc < 3) {
         std::fprintf(stderr,
-                     "usage: manifest scan <folder> [--incremental] [--db <path>]\n");
+                     "usage: manifest scan <folder> [--incremental] [--quick] "
+                     "[--db <path>]\n");
         return 2;
     }
     const fs::path root = argv[2];
@@ -248,18 +301,31 @@ int runScan(int argc, char** argv) {
         }
     }
 
+    // Optional: ScreenScraper enrichment cache.
+    const fs::path ss_json = "data/screenscraper_cache.json";
+    manifest::ScreenScraperCache ss_cache;
+    if (fs::exists(ss_json)) {
+        ss_cache = manifest::ScreenScraperCache(ss_json);
+        if (ss_cache.loaded()) {
+            std::printf("Using ScreenScraper cache: %s (%zu entries)\n",
+                        ss_json.string().c_str(), ss_cache.size());
+        }
+    }
+
     try {
         manifest::Database   db(db_path);
         manifest::Identifier identifier(tosec_opt);
         manifest::Scanner    scanner(db, identifier);
         if (menu_catalog.loaded()) scanner.setMenuCatalog(&menu_catalog);
+        if (ss_cache.loaded())     scanner.setScreenScraperCache(&ss_cache);
 
         QObject::connect(&scanner, &manifest::Scanner::progress,
             [](int i, int n, const QString& path) {
                 std::printf("[%d/%d] %s\n", i, n, path.toStdString().c_str());
             });
 
-        const auto s = scanner.scan(root, incremental);
+        std::printf("Mode: %s\n", quick ? "quick (image hash only)" : "deep (full scan)");
+        const auto s = scanner.scan(root, incremental, quick);
         manifest::MultiDiskDetector::detectAndPersist(db);
         std::printf("\n%zu scanned, %zu added, %zu updated, %zu skipped, %zu failed\n",
                     s.scanned, s.added, s.updated, s.skipped, s.failed);
@@ -288,6 +354,7 @@ int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "launch")     == 0) return runLaunch(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "import-dat")  == 0) return runImportDat(argc, argv);
     if (argc > 1 && std::strcmp(argv[1], "import-menu") == 0) return runImportMenu(argc, argv);
+    if (argc > 1 && std::strcmp(argv[1], "export")      == 0) return runExport(argc, argv);
 
     // --- GUI ----------------------------------------------------------------
     // Pull --db out of argv before handing it to QApplication.

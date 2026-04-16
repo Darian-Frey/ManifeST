@@ -23,6 +23,16 @@ QString joinMenuGames(const std::vector<manifest::MenuGame>& games) {
     return out.join(", ");
 }
 
+QString noteSingleLine(const std::optional<std::string>& notes) {
+    if (!notes || notes->empty()) return {};
+    // Collapse newlines so the cell stays on one row; Qt will elide with
+    // ellipsis if the cell is narrower than the content.
+    QString s = QString::fromStdString(*notes);
+    s.replace(QChar('\n'), QStringLiteral(" · "));
+    s.replace(QChar('\r'), QChar(' '));
+    return s;
+}
+
 QString optString(const std::optional<std::string>& v) {
     return v ? QString::fromStdString(*v) : QString{};
 }
@@ -51,6 +61,7 @@ QVariant DiskTableModel::data(const QModelIndex& index, int role) const {
     if (role == Qt::DisplayRole || role == Qt::EditRole) {
         switch (index.column()) {
             case Id:          return static_cast<qlonglong>(r.id);
+            case Filename:    return QString::fromStdString(r.filename);
             case Title:       return optString(r.identified_title);
             case Publisher:   return optString(r.publisher);
             case Year:        return r.year ? QVariant(*r.year) : QVariant{};
@@ -61,6 +72,7 @@ QVariant DiskTableModel::data(const QModelIndex& index, int role) const {
             case Identified:  return r.identified_title.has_value()
                                   ? QStringLiteral("\u2713")    // ✓
                                   : QStringLiteral("\u2717");   // ✕
+            case Notes:       return noteSingleLine(r.notes);
         }
     }
 
@@ -91,6 +103,10 @@ QVariant DiskTableModel::data(const QModelIndex& index, int role) const {
             }
             return lines.join('\n');
         }
+        if (index.column() == Notes && r.notes && !r.notes->empty()) {
+            // Full multi-line note verbatim in the tooltip.
+            return QString::fromStdString(*r.notes);
+        }
         return QString::fromStdString(r.path);
     }
 
@@ -103,6 +119,7 @@ QVariant DiskTableModel::headerData(int section, Qt::Orientation orientation, in
 
     switch (section) {
         case Id:          return QStringLiteral("ID");
+        case Filename:    return QStringLiteral("Filename");
         case Title:       return QStringLiteral("Title");
         case Publisher:   return QStringLiteral("Publisher");
         case Year:        return QStringLiteral("Year");
@@ -111,6 +128,7 @@ QVariant DiskTableModel::headerData(int section, Qt::Orientation orientation, in
         case Tags:        return QStringLiteral("Tags");
         case Contents:    return QStringLiteral("Games on this disk");
         case Identified:  return QStringLiteral("Identified?");
+        case Notes:       return QStringLiteral("Notes");
     }
     return {};
 }
@@ -123,6 +141,13 @@ void DiskTableModel::reload() {
 
 void DiskTableModel::setDatabase(Database& db) {
     db_ = &db;
+}
+
+void DiskTableModel::clearDatabase() {
+    beginResetModel();
+    db_ = nullptr;
+    rows_.clear();
+    endResetModel();
 }
 
 void DiskTableModel::upsertRow(const DiskRecord& record) {

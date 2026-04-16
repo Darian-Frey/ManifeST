@@ -10,7 +10,7 @@ namespace manifest {
 
 namespace {
 
-constexpr int kSchemaVersion = 4;
+constexpr int kSchemaVersion = 7;
 
 // Full-text-search index applied at user_version 2. Trigram tokenizer gives
 // substring matching, so `find ark` still hits "Arkanoid" the way the
@@ -58,6 +58,38 @@ CREATE TABLE IF NOT EXISTS detected_games (
     PRIMARY KEY (disk_id, game_name)
 );
 CREATE INDEX IF NOT EXISTS idx_detected_games_name ON detected_games(game_name);
+)SQL";
+
+// Applied on migration 4 → 5: file stat (mtime + size) captured at scan
+// time so incremental mode can skip unchanged images without re-hashing.
+constexpr const char* kFileStatSql = R"SQL(
+ALTER TABLE disks ADD COLUMN file_mtime INTEGER;
+ALTER TABLE disks ADD COLUMN file_size  INTEGER;
+)SQL";
+
+// Applied on migration 5 → 6: scrolltext / boot-sector-strings fragments.
+// Stored as rows rather than on the disks table so a single disk can
+// carry many fragments without column bloat.
+constexpr const char* kTextFragmentsSql = R"SQL(
+CREATE TABLE IF NOT EXISTS text_fragments (
+    disk_id  INTEGER NOT NULL REFERENCES disks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    source   TEXT    NOT NULL,   -- "boot" | "deep"
+    text     TEXT    NOT NULL,
+    PRIMARY KEY (disk_id, position)
+);
+)SQL";
+
+// Applied on migration 6 → 7: external-enrichment fields populated from
+// ScreenScraper / similar third-party hash databases. All nullable — a
+// disk can be catalogued without any of these.
+constexpr const char* kEnrichmentSql = R"SQL(
+ALTER TABLE disks ADD COLUMN genre            TEXT;
+ALTER TABLE disks ADD COLUMN synopsis         TEXT;
+ALTER TABLE disks ADD COLUMN developer        TEXT;
+ALTER TABLE disks ADD COLUMN boxart_url       TEXT;
+ALTER TABLE disks ADD COLUMN screenshot_url   TEXT;
+ALTER TABLE disks ADD COLUMN screenscraper_id INTEGER;
 )SQL";
 
 constexpr const char* kSchemaSql = R"SQL(
@@ -209,6 +241,10 @@ struct Database::Impl {
     sqlite3_stmt* detected_delete{nullptr};
     sqlite3_stmt* detected_insert{nullptr};
     sqlite3_stmt* detected_select{nullptr};
+    sqlite3_stmt* select_file_stat{nullptr};
+    sqlite3_stmt* text_delete{nullptr};
+    sqlite3_stmt* text_insert{nullptr};
+    sqlite3_stmt* text_select{nullptr};
 
     void prepare(sqlite3_stmt*& out, const char* sql) {
         if (sqlite3_prepare_v2(db, sql, -1, &out, nullptr) != SQLITE_OK) {
@@ -222,7 +258,9 @@ struct Database::Impl {
                                  &select_files, &select_tags, &select_path_exists,
                                  &fts_delete, &fts_insert, &fts_update_files,
                                  &menu_delete, &menu_insert, &menu_select,
-                                 &detected_delete, &detected_insert, &detected_select}) {
+                                 &detected_delete, &detected_insert, &detected_select,
+                                 &select_file_stat,
+                                 &text_delete, &text_insert, &text_select}) {
             if (*s) { sqlite3_finalize(*s); *s = nullptr; }
         }
     }
@@ -265,6 +303,18 @@ Database::Database(const std::filesystem::path& db_path)
     if (existing < 4) {
         exec(impl_->db, kDetectedGamesSql);
     }
+    // v4 → v5: mtime + size for fast incremental skip.
+    if (existing < 5) {
+        exec(impl_->db, kFileStatSql);
+    }
+    // v5 → v6: scrolltext / boot-sector text fragments.
+    if (existing < 6) {
+        exec(impl_->db, kTextFragmentsSql);
+    }
+    // v6 → v7: external-enrichment columns for ScreenScraper-style data.
+    if (existing < 7) {
+        exec(impl_->db, kEnrichmentSql);
+    }
     if (existing < kSchemaVersion) {
         writeUserVersion(impl_->db, kSchemaVersion);
     }
@@ -273,8 +323,11 @@ Database::Database(const std::filesystem::path& db_path)
         INSERT INTO disks (
             path, filename, image_hash, format, volume_label, oem_name,
             sides, tracks, sectors_per_track, bytes_per_sector,
-            identified_title, publisher, year, notes
-        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+            identified_title, publisher, year, notes,
+            file_mtime, file_size,
+            genre, synopsis, developer, boxart_url, screenshot_url, screenscraper_id
+        ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
+                  ?17,?18,?19,?20,?21,?22)
         ON CONFLICT(path) DO UPDATE SET
             filename          = excluded.filename,
             image_hash        = excluded.image_hash,
@@ -288,7 +341,17 @@ Database::Database(const std::filesystem::path& db_path)
             identified_title  = excluded.identified_title,
             publisher         = excluded.publisher,
             year              = excluded.year,
-            notes             = excluded.notes,
+            -- notes: preserved across rescans. Users author these; the
+            -- scanner never sets them, so we deliberately leave the stored
+            -- value alone during ON CONFLICT updates.
+            file_mtime        = excluded.file_mtime,
+            file_size         = excluded.file_size,
+            genre             = excluded.genre,
+            synopsis          = excluded.synopsis,
+            developer         = excluded.developer,
+            boxart_url        = excluded.boxart_url,
+            screenshot_url    = excluded.screenshot_url,
+            screenscraper_id  = excluded.screenscraper_id,
             scanned_at        = datetime('now')
         RETURNING id;
     )SQL");
@@ -307,7 +370,8 @@ Database::Database(const std::filesystem::path& db_path)
     impl_->prepare(impl_->select_by_hash, R"SQL(
         SELECT id, path, filename, image_hash, format, volume_label, oem_name,
                sides, tracks, sectors_per_track, bytes_per_sector,
-               identified_title, publisher, year, notes
+               identified_title, publisher, year, notes,
+               genre, synopsis, developer, boxart_url, screenshot_url, screenscraper_id
         FROM disks WHERE image_hash = ?1 LIMIT 1;
     )SQL");
 
@@ -347,6 +411,21 @@ Database::Database(const std::filesystem::path& db_path)
     impl_->prepare(impl_->detected_select, R"SQL(
         SELECT game_name, evidence FROM detected_games
         WHERE disk_id = ?1 ORDER BY game_name;
+    )SQL");
+
+    impl_->prepare(impl_->select_file_stat, R"SQL(
+        SELECT file_mtime, file_size FROM disks WHERE path = ?1 LIMIT 1;
+    )SQL");
+
+    impl_->prepare(impl_->text_delete,
+                   "DELETE FROM text_fragments WHERE disk_id = ?1;");
+    impl_->prepare(impl_->text_insert, R"SQL(
+        INSERT INTO text_fragments (disk_id, position, source, text)
+        VALUES (?1, ?2, ?3, ?4);
+    )SQL");
+    impl_->prepare(impl_->text_select, R"SQL(
+        SELECT source, text FROM text_fragments
+        WHERE disk_id = ?1 ORDER BY position;
     )SQL");
 }
 
@@ -413,6 +492,14 @@ void Database::upsertDisk(DiskRecord& record) {
     bindOptText(s, 12, record.publisher);
     bindOptInt (s, 13, record.year);
     bindOptText(s, 14, record.notes);
+    sqlite3_bind_int64(s, 15, record.file_mtime);
+    sqlite3_bind_int64(s, 16, record.file_size);
+    bindOptText(s, 17, record.genre);
+    bindOptText(s, 18, record.synopsis);
+    bindOptText(s, 19, record.developer);
+    bindOptText(s, 20, record.boxart_url);
+    bindOptText(s, 21, record.screenshot_url);
+    bindOptInt (s, 22, record.screenscraper_id);
 
     if (sqlite3_step(s) != SQLITE_ROW) {
         throwSqlite(impl_->db, "upsertDisk step");
@@ -519,6 +606,31 @@ void Database::upsertMenuContents(const DiskRecord& record) {
     tx.commit();
 }
 
+void Database::upsertTextFragments(const DiskRecord& record) {
+    Transaction tx(*this);
+
+    sqlite3_reset(impl_->text_delete);
+    sqlite3_bind_int64(impl_->text_delete, 1, record.id);
+    if (sqlite3_step(impl_->text_delete) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "delete text_fragments");
+    }
+
+    for (std::size_t i = 0; i < record.text_fragments.size(); ++i) {
+        auto& f = record.text_fragments[i];
+        auto* s = impl_->text_insert;
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+        sqlite3_bind_int64(s, 1, record.id);
+        sqlite3_bind_int  (s, 2, static_cast<int>(i));
+        bindText          (s, 3, f.source);
+        bindText          (s, 4, f.text);
+        if (sqlite3_step(s) != SQLITE_DONE) {
+            throwSqlite(impl_->db, "insert text_fragment");
+        }
+    }
+    tx.commit();
+}
+
 void Database::upsertDetectedGames(const DiskRecord& record) {
     Transaction tx(*this);
 
@@ -613,6 +725,17 @@ void loadDetectedGames(sqlite3_stmt* stmt, DiskRecord& rec) {
     }
 }
 
+void loadTextFragments(sqlite3_stmt* stmt, DiskRecord& rec) {
+    sqlite3_reset(stmt);
+    sqlite3_bind_int64(stmt, 1, rec.id);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        DiskRecord::TextFragment f;
+        f.source = colText(stmt, 0);
+        f.text   = colText(stmt, 1);
+        rec.text_fragments.push_back(std::move(f));
+    }
+}
+
 DiskRecord readDiskRow(sqlite3_stmt* s) {
     DiskRecord r;
     r.id                = sqlite3_column_int64(s, 0);
@@ -630,6 +753,12 @@ DiskRecord readDiskRow(sqlite3_stmt* s) {
     r.publisher         = colOptText(s, 12);
     r.year              = colOptInt (s, 13);
     r.notes             = colOptText(s, 14);
+    r.genre             = colOptText(s, 15);
+    r.synopsis          = colOptText(s, 16);
+    r.developer         = colOptText(s, 17);
+    r.boxart_url        = colOptText(s, 18);
+    r.screenshot_url    = colOptText(s, 19);
+    r.screenscraper_id  = colOptInt (s, 20);
     return r;
 }
 
@@ -650,6 +779,7 @@ std::optional<DiskRecord> Database::queryByHash(const std::string& image_hash) c
     loadTags         (impl_->select_tags,      r);
     loadMenuGames    (impl_->menu_select,      r);
     loadDetectedGames(impl_->detected_select,  r);
+    loadTextFragments(impl_->text_select,      r);
     return r;
 }
 
@@ -658,7 +788,8 @@ std::optional<DiskRecord> Database::queryById(int64_t id) const {
     const char* sql = R"SQL(
         SELECT id, path, filename, image_hash, format, volume_label, oem_name,
                sides, tracks, sectors_per_track, bytes_per_sector,
-               identified_title, publisher, year, notes
+               identified_title, publisher, year, notes,
+               genre, synopsis, developer, boxart_url, screenshot_url, screenscraper_id
         FROM disks WHERE id = ?1 LIMIT 1;
     )SQL";
     if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
@@ -677,6 +808,7 @@ std::optional<DiskRecord> Database::queryById(int64_t id) const {
         loadTags         (impl_->select_tags,     *out);
         loadMenuGames    (impl_->menu_select,     *out);
         loadDetectedGames(impl_->detected_select, *out);
+        loadTextFragments(impl_->text_select,     *out);
     }
     return out;
 }
@@ -686,7 +818,8 @@ std::vector<DiskRecord> Database::listAll() const {
     const char* sql = R"SQL(
         SELECT id, path, filename, image_hash, format, volume_label, oem_name,
                sides, tracks, sectors_per_track, bytes_per_sector,
-               identified_title, publisher, year, notes
+               identified_title, publisher, year, notes,
+               genre, synopsis, developer, boxart_url, screenshot_url, screenscraper_id
         FROM disks ORDER BY id;
     )SQL";
     if (sqlite3_prepare_v2(impl_->db, sql, -1, &s, nullptr) != SQLITE_OK) {
@@ -734,7 +867,8 @@ std::vector<DuplicateGroup> Database::listDuplicates() const {
     const char* sql = R"SQL(
         SELECT id, path, filename, image_hash, format, volume_label, oem_name,
                sides, tracks, sectors_per_track, bytes_per_sector,
-               identified_title, publisher, year, notes
+               identified_title, publisher, year, notes,
+               genre, synopsis, developer, boxart_url, screenshot_url, screenscraper_id
         FROM disks
         WHERE image_hash IN (
             SELECT image_hash FROM disks GROUP BY image_hash HAVING COUNT(*) > 1
@@ -854,6 +988,45 @@ void Database::rebuildDiskSets(const std::vector<DiskSet>& sets) {
     tx.commit();
 }
 
+void Database::setNotes(int64_t id, const std::string& notes) {
+    Transaction tx(*this);
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(impl_->db,
+            "UPDATE disks SET notes = ?1 WHERE id = ?2;", -1,
+            &s, nullptr) != SQLITE_OK) {
+        throwSqlite(impl_->db, "prepare setNotes");
+    }
+    if (notes.empty()) sqlite3_bind_null(s, 1);
+    else               bindText(s, 1, notes);
+    sqlite3_bind_int64(s, 2, id);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        sqlite3_finalize(s);
+        throwSqlite(impl_->db, "setNotes step");
+    }
+    sqlite3_finalize(s);
+    tx.commit();
+}
+
+void Database::checkpoint() {
+    exec(impl_->db, "PRAGMA wal_checkpoint(TRUNCATE);");
+}
+
+bool Database::fileStatMatches(const std::string& path,
+                               int64_t mtime, int64_t size) const {
+    auto* s = impl_->select_file_stat;
+    sqlite3_reset(s);
+    sqlite3_clear_bindings(s);
+    bindText(s, 1, path);
+    if (sqlite3_step(s) != SQLITE_ROW) {
+        sqlite3_reset(s);
+        return false;
+    }
+    const int64_t stored_mtime = sqlite3_column_int64(s, 0);
+    const int64_t stored_size  = sqlite3_column_int64(s, 1);
+    sqlite3_reset(s);
+    return stored_mtime == mtime && stored_size == size && stored_size > 0;
+}
+
 bool Database::pathExists(const std::string& path) const {
     auto* s = impl_->select_path_exists;
     sqlite3_reset(s);
@@ -881,7 +1054,8 @@ std::vector<DiskRecord> Database::queryByTitle(const std::string& term) const {
         SELECT d.id, d.path, d.filename, d.image_hash, d.format,
                d.volume_label, d.oem_name, d.sides, d.tracks,
                d.sectors_per_track, d.bytes_per_sector,
-               d.identified_title, d.publisher, d.year, d.notes
+               d.identified_title, d.publisher, d.year, d.notes,
+               d.genre, d.synopsis, d.developer, d.boxart_url, d.screenshot_url, d.screenscraper_id
         FROM disks_fts f
         JOIN disks d ON d.id = f.rowid
         WHERE disks_fts MATCH ?1

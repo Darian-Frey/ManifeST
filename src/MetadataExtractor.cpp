@@ -46,18 +46,9 @@ std::string MetadataExtractor::sha1Hex(const std::vector<uint8_t>& bytes) {
     return sha1Hex(bytes.data(), bytes.size());
 }
 
-void MetadataExtractor::enrich(const DiskReader& reader, DiskRecord& record) {
-    // Image hash — the raw (decompressed) image bytes.
-    record.image_hash = sha1Hex(reader.rawImage());
+namespace {
 
-    // Per-file hash.
-    for (std::size_t i = 0; i < record.files.size(); ++i) {
-        auto bytes = reader.readFileBytes(i);
-        record.files[i].file_hash = sha1Hex(bytes);
-    }
-
-    // Launcher heuristic: if the root directory contains exactly one file
-    // with a PRG / APP / TOS extension, flag it as the launcher.
+void flagLauncher(DiskRecord& record) {
     std::size_t launcher_idx   = 0;
     std::size_t launcher_count = 0;
     for (std::size_t i = 0; i < record.files.size(); ++i) {
@@ -70,6 +61,22 @@ void MetadataExtractor::enrich(const DiskReader& reader, DiskRecord& record) {
     if (launcher_count == 1) {
         record.files[launcher_idx].is_launcher = true;
     }
+}
+
+} // namespace
+
+void MetadataExtractor::enrich(const DiskReader& reader, DiskRecord& record) {
+    record.image_hash = sha1Hex(reader.rawImage());
+    for (std::size_t i = 0; i < record.files.size(); ++i) {
+        auto bytes = reader.readFileBytes(i);
+        record.files[i].file_hash = sha1Hex(bytes);
+    }
+    flagLauncher(record);
+}
+
+void MetadataExtractor::enrichImageOnly(const DiskReader& reader, DiskRecord& record) {
+    record.image_hash = sha1Hex(reader.rawImage());
+    flagLauncher(record);
 }
 
 } // namespace manifest

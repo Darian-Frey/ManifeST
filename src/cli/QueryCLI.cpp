@@ -116,6 +116,16 @@ void printInfo(const DiskRecord& r) {
         for (const auto& t : r.tags) std::printf(" %s", t.c_str());
         std::puts("");
     }
+    if (r.notes && !r.notes->empty()) {
+        std::printf("notes\n");
+        // Indent each line for readable display.
+        std::string line;
+        for (char c : *r.notes) {
+            if (c == '\n') { std::printf("  %s\n", line.c_str()); line.clear(); }
+            else           { line += c; }
+        }
+        if (!line.empty()) std::printf("  %s\n", line.c_str());
+    }
     if (!r.menu_games.empty()) {
         std::printf("menu games (%zu):\n", r.menu_games.size());
         for (const auto& g : r.menu_games) {
@@ -143,6 +153,7 @@ void printHelp() {
         "  tags <tag>      List disks carrying <tag>\n"
         "  dupes           Show duplicate-image groups\n"
         "  sets            Show multi-disk sets\n"
+        "  note <id>       Edit / clear the note for a disk (multi-line, end with .)\n"
         "  help            Show this message\n"
         "  quit | exit     Leave the shell");
 }
@@ -226,6 +237,30 @@ int QueryCLI::run() {
                                     static_cast<long long>(d.id), d.path.c_str());
                     }
                 }
+            }
+            else if (cmd == "note") {
+                if (args.empty()) { std::puts("usage: note <id>"); continue; }
+                const int64_t id = std::stoll(args);
+                auto r = db_.queryById(id);
+                if (!r) { std::printf("no such id: %lld\n", static_cast<long long>(id)); continue; }
+
+                std::printf("Current note for id=%lld (%s):\n",
+                            static_cast<long long>(id),
+                            r->identified_title.value_or(r->filename).c_str());
+                if (r->notes && !r->notes->empty()) std::printf("  %s\n", r->notes->c_str());
+                else                                std::puts("  (none)");
+                std::puts("Enter new note; single '.' on its own line finishes. "
+                          "Empty input clears the note.");
+
+                std::string buf;
+                std::string line;
+                while (std::getline(std::cin, line)) {
+                    if (line == ".") break;
+                    if (!buf.empty()) buf += '\n';
+                    buf += line;
+                }
+                db_.setNotes(id, buf);
+                std::printf("%s\n", buf.empty() ? "Note cleared." : "Note saved.");
             }
             else if (cmd == "sets") {
                 const auto sets = db_.listDiskSets();

@@ -6,6 +6,157 @@ Everything you need to know to scan a folder of Atari ST disk images, find a tit
 
 ---
 
+## Contents
+
+- [0. Quick Reference](#0-quick-reference) — every command, flag, shortcut, and data file in one place
+- [1. First-time Setup](#1-first-time-setup)
+- [2. Database Location](#2-database-location)
+- [3. Scanning a Folder](#3-scanning-a-folder)
+- [4. Browsing: GUI](#4-browsing-gui)
+- [5. Browsing: CLI Query Shell](#5-browsing-cli-query-shell)
+- [6. Importing a TOSEC DAT](#6-importing-a-tosec-dat-hash-based-identification)
+- [7. Importing Menu-Disk Contents](#7-importing-menu-disk-contents-medway-pompey-d-bug-)
+- [8. ScreenScraper Enrichment](#8-screenscraper-enrichment-genre-synopsis-box-art)
+- [9. Diagnostic Mode](#9-diagnostic-mode)
+- [10. Notes (per-disk user comments)](#10-notes-per-disk-user-comments)
+- [11. How Identification Works](#11-how-identification-works)
+- [12. Multi-disk Set Detection](#12-multi-disk-set-detection)
+- [13. Troubleshooting](#13-troubleshooting)
+- [14. Moving or Backing Up the Catalogue](#14-moving-or-backing-up-the-catalogue)
+- [15. Data Integrity Notes](#15-data-integrity-notes)
+- [16. Getting Help](#16-getting-help)
+
+---
+
+## 0. Quick Reference
+
+### CLI subcommands
+
+| Command | What it does |
+|---|---|
+| `manifest` | Launch the GUI (picks up last-used DB from QSettings) |
+| `manifest --gui` | Same, explicit |
+| `manifest --db <path>` | Launch GUI against a specific DB |
+| `manifest scan <folder>` | Deep scan — full pipeline |
+| `manifest scan <folder> --quick` | Quick scan — image hash + file listing + identify only (≈90× faster) |
+| `manifest scan <folder> --incremental` | Skip images whose path + mtime + size haven't changed |
+| `manifest scan <folder> --tosec-json <path>` | Override the TOSEC hash DB location |
+| `manifest inspect <image-path>` | Diagnostic dump of one disk (no DB writes) |
+| `manifest query` | Interactive `manifest>` shell |
+| `manifest query --find <term>` | One-shot text search; exit 0 on match, 1 on none |
+| `manifest launch <id>` | Fire-and-forget Hatari launcher by disk ID |
+| `manifest import-dat <file.dat>` | Parse a TOSEC ClrMamePro DAT into `data/tosec_titles.json` |
+| `manifest import-menu spiny <file>` | Import spiny.org Medway Boys menu list |
+| `manifest import-menu 8bitchip <file>` | Import 8bitchip.info multi-group menu index |
+| `manifest export --format <csv/json/m3u>` | Dump the catalogue in the chosen format |
+
+All subcommands accept `--db <path>` to target a specific database. Omit to use `$MANIFEST_DB` env var, or fall back to `$HOME/manifest.db`.
+
+### Interactive shell commands (`manifest query`)
+
+| Command | What it does |
+|---|---|
+| `find <term>` | FTS5 substring search across title / publisher / label / filenames / menu games / detected games |
+| `list` | Every disk in the catalogue |
+| `info <id>` | Full record for one disk |
+| `launch <id>` | Exec Hatari with that disk |
+| `tags` / `tags <tag>` | All tags with counts / list disks carrying a tag |
+| `dupes` | Image-hash duplicate groups |
+| `sets` | Multi-disk sets with members |
+| `note <id>` | Edit (multi-line) or clear the note attached to a disk. Finish input with a single `.` on its own line; empty input clears. |
+| `help` / `?` | Show the command list |
+| `quit` / `exit` / `q` | Leave the shell |
+
+### GUI actions
+
+| Menu path | Shortcut | What it does |
+|---|---|---|
+| File ▸ New Database… | `Ctrl+N` | Create a fresh, empty catalogue at a chosen path (refuses to overwrite an existing file) |
+| File ▸ Open Database… | `Ctrl+O` | Switch to a different `.db` file |
+| File ▸ Save Database As… | `Ctrl+Shift+S` | Copy current DB to a new path, switch to it |
+| File ▸ Close Database | `Ctrl+W` | Unload the current DB without opening another — scan/save actions disable, table empties |
+| File ▸ Delete Database… | — | **Destructive**: permanently deletes the DB file (+ WAL/SHM sidecars) from disk. Requires typing the filename to confirm. |
+| File ▸ Quit | `Ctrl+Q` | Exit |
+| Edit ▸ Edit Note for Selected Disk… | `Ctrl+E` | Attach or edit a user-authored note on the selected disk |
+| Scan ▸ Quick Scan… | `Ctrl+S` | Fast scan of a folder (image-level metadata only) |
+| Scan ▸ Deep Scan… | `F6` | Full-pipeline scan of a folder |
+| Scan ▸ Rescan | `F5` | Re-run the last folder in its last mode, non-incremental |
+| View ▸ Show Identified column | — | Toggle the ✓/✕ column |
+| View ▸ Show 'Games on this disk' column | — | Toggle the menu-contents column |
+| Help ▸ Instructions | `F1` | Open this document in a reader window |
+| Help ▸ About ManifeST | — | Version / license / attribution dialog |
+| — (toolbar) | `Ctrl+F` | Focus the search box |
+
+### Row actions (right-click on a table row)
+
+- **Launch in Hatari** — starts the emulator with the selected image
+- **Show in Files** — open the containing folder in your system file manager
+- **Copy Path** — absolute image path to the clipboard
+- **Edit Note…** — attach or edit a user-authored note (multi-line, preserved across rescans)
+- **Remove from Catalog…** — delete the DB row (with confirmation). The `.st` file on disk is NOT deleted.
+
+### Sidebar filters (left dock)
+
+Click any node to filter the main table:
+
+- **All Disks** — reset filter
+- **Duplicates** — images sharing an image_hash with another disk
+- **Tags** (expandable) — every tag with a disk count
+- **Multi-disk Sets** (expandable) — auto-grouped sets, click a set to show its members
+
+### Data files
+
+| Path | Purpose | Format | Gitignored? |
+|---|---|---|---|
+| `data/tosec_titles.json` | TOSEC hash → title DB, built via `import-dat` | JSON, `{sha1: {title, publisher, year, tags}}` | Yes |
+| `data/menu_disk_contents.json` | Cracker-menu contents, built via `import-menu` (seed ships in repo) | JSON, `{group_code: {disk_number: [games]}}` | No |
+| `data/screenscraper_cache.json` | Optional ScreenScraper offline cache, built via `tools/screenscraper_sync.py` | JSON, `{version, games: {sha1: {...}}}` | Yes |
+| `~/manifest.db` | Default SQLite catalogue — can override with `--db` or `$MANIFEST_DB` | SQLite 3, WAL, schema v7 | N/A — user data |
+
+### Environment variables
+
+| Name | Used by | Default |
+|---|---|---|
+| `MANIFEST_DB` | All subcommands | `$HOME/manifest.db` |
+| `SS_DEV_ID` | `tools/screenscraper_sync.py` | (required — from screenscraper.fr) |
+| `SS_DEV_PASSWORD` | `tools/screenscraper_sync.py` | (required) |
+| `SS_USER` | `tools/screenscraper_sync.py` | (optional — raises rate limits) |
+| `SS_USER_PASSWORD` | `tools/screenscraper_sync.py` | (optional) |
+| `SS_SOFT_NAME` | `tools/screenscraper_sync.py` | `ManifeST` |
+| `SS_DELAY_SEC` | `tools/screenscraper_sync.py` | `1.0` |
+| `SS_SYSTEM_ID` | `tools/screenscraper_sync.py` | `42` (Atari ST on ScreenScraper) |
+
+### Identification pipeline (priority order)
+
+Applied in sequence; the first pass producing a non-empty title wins for that field. Later passes may still fill unrelated fields (genre, synopsis, etc.).
+
+1. **SHA1 hash lookup** against `data/tosec_titles.json` — most authoritative
+2. **TOSEC filename parse** — `Title (Year)(Publisher)[flags].ext`
+3. **Heuristics** — volume label → OEM → lone-launcher filename
+4. **ScreenScraper cache** — fills genre / synopsis / developer / box art (skipped if already set)
+
+Orthogonal tags applied regardless of which pass identified:
+
+- `multidisk-NofM`, `cracked`, `trained`, `hacked`, `alt`, `verified` — from TOSEC flags
+- Cracker-group names (D-Bug, Medway Boys, Pompey Pirates, Vectronix, …) — via the parallel group detector
+- `raw-loader` — when the engine reports `isRawLoaderDisk()`
+
+### Schema versions
+
+Current SQLite schema version: **7**. ManifeST auto-migrates older DBs forward on open; downgrades refuse with a clear error.
+
+| Version | Added |
+|---|---|
+| 1 | Initial — disks, files, tags, disk_sets |
+| 2 | FTS5 `disks_fts` virtual table with trigram tokenizer |
+| 3 | `menu_contents` table (cracker-menu games) |
+| 4 | `detected_games` table (byte-scan matches) |
+| 5 | `file_mtime` + `file_size` columns on `disks` |
+| 6 | `text_fragments` table (scrolltext / boot strings) |
+| 7 | `genre / synopsis / developer / boxart_url / screenshot_url / screenscraper_id` on `disks` |
+
+---
+
 ## 1. First-time Setup
 
 ### 1.1 Install the dependencies
@@ -74,14 +225,33 @@ The GUI additionally remembers the last DB path via `QSettings`, so after the fi
 
 ## 3. Scanning a Folder
 
-### 3.1 From the command line
+### 3.1 Scan modes: quick vs deep
+
+`manifest scan` supports two depths:
+
+| Mode | Flag | What it does | What it *skips* |
+|------|------|--------------|-----------------|
+| Quick | `--quick` | Image SHA1, file listing, TOSEC/menu-catalog identification, mtime tracking | Per-file hashes, byte-level game detection, scrolltext extraction, cracker-group signature scan |
+| Deep  | (default, no flag) | Everything above + per-file SHA1s + game detection + scrolltext + cracker signatures | — |
+
+**Use Quick when** you're cataloguing a fresh folder and just want titles/identification fast. Roughly **~90× faster** on a 44-disk test (0.18s vs 15.6s) — scales linearly to your full collection.
+
+**Use Deep when** you want the full knowledge graph: per-file dedup, "find this game's name in the disk bytes", cracktro scrolltext, cracker-group tags.
+
+You can always upgrade a Quick-scanned DB to Deep by re-running without `--quick` (non-incremental).
+
+### 3.2 From the command line
 
 ```sh
-# First scan
+# Quick scan — fast, minimum useful catalogue
+manifest scan ~/AtariCollection --db ~/manifest.db --quick
+
+# Deep scan — full pipeline (default)
 manifest scan ~/AtariCollection --db ~/manifest.db
 
-# Subsequent re-scans — skip images already in the DB by path
+# Subsequent re-scans — skip images already in the DB if path+mtime+size match
 manifest scan ~/AtariCollection --db ~/manifest.db --incremental
+manifest scan ~/AtariCollection --db ~/manifest.db --incremental --quick
 ```
 
 Each image prints `[i/N] path` as it's processed. On completion you get:
@@ -98,15 +268,17 @@ db: /home/you/manifest.db
 
 The scanner also runs **multi-disk set detection** automatically after the scan finishes.
 
-### 3.2 From the GUI
+### 3.3 From the GUI
 
 1. Launch `manifest` (with `--db` the first time, or let it reopen the remembered DB)
-2. `Scan ▸ Scan Folder…` (or `Ctrl+S`)
+2. Pick a scan mode:
+   - `Scan ▸ Quick Scan…` (or `Ctrl+S`) — fast; image hash + file listing + TOSEC/catalog match
+   - `Scan ▸ Deep Scan…` (or `F6`) — full pipeline (per-file hashes, byte-level game detection, cracker signatures, scrolltext)
 3. Pick the folder
 4. Watch the table fill in live — status bar shows `[i/N] filename` with a progress bar
 5. `Cancel` aborts after the current image finishes
 
-`Scan ▸ Rescan` (or `F5`) re-runs the last folder in full (non-incremental) mode, which is what you want after editing TOSEC filenames.
+`Scan ▸ Rescan` (or `F5`) re-runs the last folder, in whichever mode you last used, non-incrementally (picks up renames, edited TOSEC metadata, etc.).
 
 ---
 
@@ -114,7 +286,9 @@ The scanner also runs **multi-disk set detection** automatically after the scan 
 
 ### 4.1 The main table
 
-Columns: `ID` · `Title` · `Publisher` · `Year` · `Format` · `Volume Label` · `Tags` · `Identified?`
+Columns (left to right): `ID` · `Filename` · `Title` · `Publisher` · `Year` · `Format` · `Volume Label` · `Tags` · `Games on this disk` · `Identified?` · `Notes`
+
+The **Filename** column always has a value (the raw `.st` filename on disk) so unidentified rows still show something scannable. The **Notes** column shows a one-line preview of any attached note; hover for the full multi-line content, or select the row and `Ctrl+E` to edit.
 
 - Click a header to sort
 - Type in the search box (or `Ctrl+F`) to filter live — matches substring in any column
@@ -150,6 +324,16 @@ Right-click menu also offers:
 ### 4.5 Switching databases
 
 `File ▸ Open Database…` (or `Ctrl+O`) — pops a file picker. The GUI reopens the chosen DB, rebuilds the model + sidebar, and updates the window title. The last-used path is remembered for the next launch.
+
+### 4.6 Saving the database somewhere else
+
+`File ▸ Save Database As…` (or `Ctrl+Shift+S`) — pops a Save dialog. Flushes the SQLite write-ahead log into the main `.db` file, copies it to the chosen path, and switches to the new file. The original stays put — this is a *copy-and-switch*, not a move. Useful for:
+
+- Keeping a named "snapshot" of the catalogue before a big rescan
+- Working copies vs long-term archive copies
+- Migrating the DB to an external drive or syncing folder
+
+If you pick the currently-open DB path, ManifeST says so and does nothing (no-op guard).
 
 ---
 
@@ -362,7 +546,75 @@ CLI).
 
 ---
 
-## 8. Diagnostic Mode
+## 8. ScreenScraper Enrichment (genre, synopsis, box art)
+
+ScreenScraper ([screenscraper.fr](https://www.screenscraper.fr/)) is a
+free, community-maintained retro gaming database that **matches by
+file checksum** — works with ManifeST's SHA1 pipeline regardless of
+filename. Coverage on Atari ST `.ST` / `.MSA` files is not guaranteed
+but hits add genre, developer, synopsis, box-art URL, and screenshot
+URL to your catalogue.
+
+### Setup
+
+1. Register a free account at <https://www.screenscraper.fr/> and
+   request a **developer ID / password** (look for "API" on your
+   account page — the community will typically approve within a day
+   or two).
+2. Set env vars:
+
+```sh
+export SS_DEV_ID=...
+export SS_DEV_PASSWORD=...
+# Optional but recommended — raises rate limits:
+export SS_USER=your-screenscraper-username
+export SS_USER_PASSWORD=your-user-password
+```
+
+### Sync
+
+```sh
+# Full sync — walks every disk in the catalogue, queries ScreenScraper,
+# writes/appends data/screenscraper_cache.json. Polite 1s delay between
+# requests; checkpoint every 25 rows; resumable if interrupted.
+./tools/screenscraper_sync.py --db ~/manifest.db
+
+# Try a small batch first to test credentials
+./tools/screenscraper_sync.py --db ~/manifest.db --limit 20
+```
+
+The script prints per-disk `hit` / `miss` so you can see coverage
+live. Misses are cached too (as `{}`) so re-runs skip them.
+
+### Use it
+
+Rescan (non-incremental) after syncing:
+
+```sh
+./build/manifest scan ~/AtariCollection --db ~/manifest.db
+```
+
+Hits appear in the GUI Details dock as new rows: **Genre**,
+**Developer**, **Box art** (clickable), **Screenshot** (clickable),
+and a full **Synopsis** paragraph. CLI `info <id>` also shows
+these fields.
+
+### Fill-only semantics
+
+ScreenScraper is the **last** enrichment pass — it only fills fields
+that are still empty. So if TOSEC already set publisher to "Imagine"
+and ScreenScraper says "Taito", TOSEC wins. This protects the more
+authoritative sources (TOSEC DAT hash match, filename parse) from
+being overwritten by ScreenScraper's more general data.
+
+### Don't have credentials?
+
+ManifeST runs fine without ScreenScraper — the cache file is purely
+optional. Missing genre/synopsis fields just stay empty.
+
+---
+
+## 9. Diagnostic Mode
 
 ```sh
 manifest inspect path/to/image.st
@@ -376,7 +628,66 @@ Runs the full pipeline against one image **without touching the database** and p
 
 ---
 
-## 9. How Identification Works
+## 10. Notes (per-disk user comments)
+
+Every disk can carry a free-form, multi-line note. Notes are stored in the
+`notes` column on the `disks` table and are **never touched by the scanner**
+— they survive full rescans, incremental rescans, and reidentification.
+
+### Editing from the GUI
+
+- Select a row → **Edit ▸ Edit Note for Selected Disk…** (or `Ctrl+E`), *or*
+- Right-click a row → **Edit Note…**
+
+Either pops a multi-line text dialog with the current note pre-loaded.
+OK saves, Cancel discards. Entering empty text clears the note back to NULL.
+
+Saved notes appear as a highlighted yellow box at the top of the Details
+dock the next time you click the row — hard to miss.
+
+### Editing from the CLI shell
+
+```sh
+manifest query --db ~/manifest.db
+manifest> note 42
+Current note for id=42 (Dungeon Master):
+  (none)
+Enter new note; single '.' on its own line finishes. Empty input clears the note.
+Bought this at a car boot sale in 1991. Original box a bit dented
+but disk reads cleanly. Still my favourite RPG.
+.
+Note saved.
+```
+
+Enter as many lines as you want; a single `.` on its own line closes
+the note and persists it. Submit zero lines (just `.`) to clear.
+
+`info <id>` always shows the current note indented under a `notes` header.
+
+### Notes in exports
+
+- **CSV**: last column (`notes`)
+- **JSON**: `notes` field on every disk object (omitted if null)
+- **M3U**: playlist format has no note semantics, so notes are skipped
+
+### Why notes survive rescans
+
+`upsertDisk` deliberately excludes `notes` from the `ON CONFLICT UPDATE`
+clause. The scanner can overwrite every other field (title, publisher,
+tags, menu games, scrolltext, etc.), but *never* touches the note. Your
+comments are safe no matter how many times you re-scan the folder.
+
+### Good uses
+
+- "Disk edge slightly damaged; reads but consider imaging soon"
+- "Got this from Alice's collection — her handwriting on the label"
+- "Crashes in Hatari 2.5, try STeem"
+- "This is the PAL 50Hz version, NOT the NTSC version"
+- "Duplicate of id=123 but keeping the original label intact"
+
+---
+
+## 11. How Identification Works
 
 Three passes run in order on every image; the first pass to produce a non-empty title wins.
 
@@ -413,7 +724,7 @@ Regardless of which pass identifies the title, the following are tagged automati
 
 ---
 
-## 10. Multi-disk Set Detection
+## 12. Multi-disk Set Detection
 
 After each scan, ManifeST runs a grouping pass with two strategies unioned:
 
@@ -424,7 +735,7 @@ Results go into the `disk_sets` table and surface in the sidebar (GUI) / `sets` 
 
 ---
 
-## 11. Troubleshooting
+## 13. Troubleshooting
 
 ### "hatari not found on $PATH"
 
@@ -449,7 +760,7 @@ cmake --build build -j
 
 ### GUI shows "Empty catalog"
 
-You haven't scanned a folder into this DB yet. `Scan ▸ Scan Folder…` (or `Ctrl+S`).
+You haven't scanned a folder into this DB yet. `Scan ▸ Quick Scan…` (or `Ctrl+S`) for a fast first pass, or `Scan ▸ Deep Scan…` (F6) for the full pipeline.
 
 ### Scan fails on a specific image
 
@@ -465,7 +776,7 @@ That's the engine's internal diagnostic print, not ManifeST's. Harmless. A futur
 
 ---
 
-## 12. Moving or Backing Up the Catalogue
+## 14. Moving or Backing Up the Catalogue
 
 Everything lives in the single `manifest.db` file. Copy it anywhere — ManifeST is portable as long as the image paths stored inside are still reachable.
 
@@ -483,7 +794,7 @@ The `image_hash` doesn't change, so duplicate detection still works correctly af
 
 ---
 
-## 13. Data Integrity Notes
+## 15. Data Integrity Notes
 
 - `disks.path` is `UNIQUE` — re-scanning the same path updates in place
 - `files` and `tags` cascade-delete on disk removal
@@ -494,7 +805,7 @@ The `image_hash` doesn't change, so duplicate detection still works correctly af
 
 ---
 
-## 14. Getting Help
+## 16. Getting Help
 
 - `manifest query` → `help` — command list
 - Open a GitHub issue: <https://github.com/Darian-Frey> (the ManifeST repo once it's public)

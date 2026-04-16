@@ -178,4 +178,12 @@ std::vector<uint8_t> DiskReader::readFileBytes(size_t file_index) const {
     return impl_->engine.readFile(impl_->dir_entries[file_index]);
 }
 
+std::vector<std::string> DiskReader::bootSectorStrings() const {
+    std::vector<std::string> out;
+    const auto q = impl_->engine.getBootSectorStrings();
+    out.reserve(static_cast<std::size_t>(q.size()));
+    for (const auto& s : q) out.push_back(qToStd(s));
+    return out;
+}
+
 } // namespace manifest

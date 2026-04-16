@@ -3,6 +3,9 @@ build/
 build-*/
 out/
 cmake-build-*/
+dist/
+packaging/.tools/
+*.AppImage
 
 # --- CMake artifacts ---
 CMakeCache.txt
@@ -27,6 +30,7 @@ compile_commands.json
 *.exe
 *.out
 *.app
+*.py
 
 # --- Dependency / preprocessed files ---
 *.d

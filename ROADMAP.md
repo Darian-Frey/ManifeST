@@ -43,6 +43,28 @@ Status legend: ✅ done · 🔨 in progress · ⏳ todo · ⏸ blocked · ❓ ne
 - [x] `Database::listAll()` now hydrates `menu_games` alongside `tags` so the table populates without per-row queries
 - [x] FTS5 search for games already worked at CLI: `find Lotus` → MB98, `find Mean Streets` → both parts of MB99
 
+## Parallel Cracker-Group Detector ✅
+
+- [x] `CrackerGroupDetector` — signature table with 27 groups (~60 patterns), word-boundary matching via `GameStringScanner::extractRuns`
+- [x] Scans the whole image, not just boot sector — catches group attributions in cracktro text, scrolltexts, embedded loaders
+- [x] Signatures require ≥5 chars and word boundaries — zero false positives on the 44-disk test collection
+- [x] Scanner integration: each hit becomes a disk tag, deduped against engine-supplied tags
+- [x] `detectWithEvidence()` API exposes `(group, pattern, evidence_run)` triples for diagnostics
+- [x] Fix: swapped `std::initializer_list<const char*>` → `std::vector<const char*>` in signature table (initializer-list storage as struct member dangles after construction)
+- [x] Real-world results on 44 disks:
+  - Added new groups: **Pompey Pirates** (3 new attributions), **Empire** (1), **Pompey Krappy** (1), **Vectronix** (1), **Was (Not Was)** (1)
+  - Deepened engine coverage: **Medway Boys** 17 disks (vs engine's shallower boot-sector hits), **Replicants** 6 (vs 1)
+- [x] Candidate for upstream into `AtariDiskEngine::detect*Signature()` once stabilised
+
+## Fast Incremental Scan (mtime + size) ✅
+
+- [x] Schema v4 → v5: added `file_mtime` + `file_size` columns to `disks`
+- [x] Scanner stats the file upfront, records epoch-seconds mtime + byte size on every scan
+- [x] `Database::fileStatMatches(path, mtime, size)` — O(1) check against indexed unique path
+- [x] `--incremental` mode now does path-exists + stat-match; unchanged files skip the entire pipeline (no decompression, no hashing, no identifier)
+- [x] Benchmark on 44-disk collection: full **15.66 s** → incremental **0.01 s** (~1500× speedup)
+- [x] Projected benefit at 4,500-disk target: ~25 min → ~1 sec for an unchanged collection
+
 ## TOSEC DAT Import ✅
 - [x] `manifest::DatImporter` — ClrMamePro format parser (hand-rolled lexer, ~200 lines), no new deps
 - [x] Tokenises `game (...)` / `rom (...)` blocks, extracts `name` + `sha1` pairs, skips everything else
@@ -253,7 +275,13 @@ Owned by Shane on a separate laptop. Not tracked here.
 
 - [x] FTS5 virtual table for faster `find` across title + filenames — **DONE**
 - [x] TOSEC DAT import (hash-based identification survives file renames) — **DONE**
-- [x] Cracker / menu-disk content catalog (Medway, Pompey, D-Bug, Automation, …) — **DONE** (see below)
+- [x] Cracker / menu-disk content catalog (Medway, Pompey, D-Bug, Automation, …) — **DONE**
+- [x] Byte-level game detection (string scan + catalog-corpus intersection) — **DONE**
+- [x] Parallel cracker-group detector in ManifeST (candidate for upstream into engine) — **DONE** (see below)
+- [x] mtime/size incremental scan — **DONE**
+- [x] Export command — CSV / JSON / M3U — **DONE**
+- [x] Scrolltext viewer — boot-sector + deep-scan text fragments persisted & shown in GUI — **DONE**
+- [x] ScreenScraper offline-cache enrichment — Python sync script + C++ consumer + schema v7 — **DONE**
 - [ ] Cover-art support if a good source ever surfaces
 - [ ] Export catalog to CSV / JSON
 - [ ] Import TOSEC DAT files directly (not just a pre-baked JSON)

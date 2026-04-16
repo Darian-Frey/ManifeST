@@ -1,17 +1,21 @@
 #include "manifest/Scanner.hpp"
 
+#include "manifest/CrackerGroupDetector.hpp"
 #include "manifest/Database.hpp"
 #include "manifest/DiskReader.hpp"
 #include "manifest/GameStringScanner.hpp"
 #include "manifest/Identifier.hpp"
 #include "manifest/MenuDiskCatalog.hpp"
 #include "manifest/MetadataExtractor.hpp"
+#include "manifest/ScreenScraperCache.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace manifest {
@@ -53,7 +57,8 @@ void Scanner::requestCancel() {
     cancel_.store(true, std::memory_order_relaxed);
 }
 
-Scanner::Summary Scanner::scan(const std::filesystem::path& root, bool incremental) {
+Scanner::Summary Scanner::scan(const std::filesystem::path& root,
+                               bool incremental, bool quick) {
     cancel_.store(false, std::memory_order_relaxed);
     Summary summary;
 
@@ -76,7 +81,26 @@ Scanner::Summary Scanner::scan(const std::filesystem::path& root, bool increment
         ++summary.scanned;
 
         const bool already_in_db = db_.pathExists(path_str);
-        if (incremental && already_in_db) {
+
+        // Stat the file upfront so we can use mtime/size for the
+        // incremental-skip check AND record them if we do scan.
+        std::error_code ec;
+        const auto fsize = std::filesystem::file_size(path, ec);
+        int64_t file_size = 0;
+        int64_t file_mtime = 0;
+        if (!ec) {
+            file_size = static_cast<int64_t>(fsize);
+            const auto ftime = std::filesystem::last_write_time(path, ec);
+            if (!ec) {
+                // Cast to system_clock for epoch-seconds reading.
+                const auto sys_tp = std::chrono::file_clock::to_sys(ftime);
+                file_mtime = std::chrono::duration_cast<std::chrono::seconds>(
+                    sys_tp.time_since_epoch()).count();
+            }
+        }
+
+        if (incremental && already_in_db &&
+            db_.fileStatMatches(path_str, file_mtime, file_size)) {
             ++summary.skipped;
             continue;
         }
@@ -84,17 +108,47 @@ Scanner::Summary Scanner::scan(const std::filesystem::path& root, bool increment
         try {
             DiskReader reader(path);
             DiskRecord rec = reader.takeRecord();
-            MetadataExtractor::enrich(reader, rec);
+            rec.file_mtime = file_mtime;
+            rec.file_size  = file_size;
+
+            // Hashing — full (per-file) in deep mode, image-only in quick.
+            if (quick) MetadataExtractor::enrichImageOnly(reader, rec);
+            else       MetadataExtractor::enrich        (reader, rec);
+
             identifier_.identify(rec);
-            if (menu_catalog_) {
-                menu_catalog_->enrich(rec);
-                // Byte-level game detection: match printable ASCII runs in
-                // the raw image against the catalog's known-games corpus.
-                // Runs independently of the catalog hit — useful for cross
-                // -checking (agreement with curated list) and for finding
-                // games on un-catalogued disks.
-                rec.detected_games = GameStringScanner::scan(
-                    reader.rawImage(), menu_catalog_->allKnownGamesUpper());
+            if (ss_cache_)     ss_cache_->enrich(rec);
+            if (menu_catalog_) menu_catalog_->enrich(rec);
+
+            // The three byte-scanning passes below dominate scan time.
+            // Quick mode skips all of them — image hash + file listing +
+            // catalog enrichment alone still produce a useful catalogue
+            // for the common "point-at-folder, see what's there" case.
+            if (!quick) {
+                if (menu_catalog_) {
+                    rec.detected_games = GameStringScanner::scan(
+                        reader.rawImage(), menu_catalog_->allKnownGamesUpper());
+                }
+                for (const auto& group :
+                     CrackerGroupDetector::detect(reader.rawImage())) {
+                    if (std::find(rec.tags.begin(), rec.tags.end(), group)
+                        == rec.tags.end()) {
+                        rec.tags.push_back(group);
+                    }
+                }
+                for (const auto& s : reader.bootSectorStrings()) {
+                    if (s.size() < 4) continue;
+                    rec.text_fragments.push_back({"boot", s});
+                }
+                GameStringScanner::Config cfg{30, 512, 6};
+                auto runs = GameStringScanner::extractRuns(reader.rawImage(), cfg);
+                std::sort(runs.begin(), runs.end(),
+                          [](const std::string& a, const std::string& b){
+                              return a.size() > b.size();
+                          });
+                const std::size_t kMaxDeep = 25;
+                for (std::size_t i = 0; i < runs.size() && i < kMaxDeep; ++i) {
+                    rec.text_fragments.push_back({"deep", std::move(runs[i])});
+                }
             }
 
             {
@@ -104,6 +158,7 @@ Scanner::Summary Scanner::scan(const std::filesystem::path& root, bool increment
                 db_.upsertTags(rec);
                 db_.upsertMenuContents(rec);
                 db_.upsertDetectedGames(rec);
+                db_.upsertTextFragments(rec);
                 tx.commit();
             }
 

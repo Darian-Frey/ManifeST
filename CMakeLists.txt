@@ -50,6 +50,9 @@ add_library(manifest_lib STATIC
     src/MenuDiskCatalog.cpp
     src/MenuImporter.cpp
     src/GameStringScanner.cpp
+    src/CrackerGroupDetector.cpp
+    src/Exporter.cpp
+    src/ScreenScraperCache.cpp
     # Q_OBJECT headers — listed so AUTOMOC finds them.
     include/manifest/Scanner.hpp
 )
@@ -102,6 +105,8 @@ target_link_libraries(manifest
 # --- Install / packaging (Linux) -------------------------------------------
 include(GNUInstallDirs)
 install(TARGETS manifest RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES INSTRUCTIONS.md README.md LICENSE
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/manifest)
 if(UNIX AND NOT APPLE)
     install(FILES packaging/manifest.desktop
             DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
