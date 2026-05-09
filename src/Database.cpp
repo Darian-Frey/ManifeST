@@ -10,27 +10,29 @@ namespace manifest {
 
 namespace {
 
-constexpr int kSchemaVersion = 7;
+constexpr int kSchemaVersion = 8;
 
 // Full-text-search index applied at user_version 2. Trigram tokenizer gives
 // substring matching, so `find ark` still hits "Arkanoid" the way the
-// old LIKE '%ark%' query did.
+// old LIKE '%ark%' query did. Schema includes the v8 `notes` column up
+// front so fresh DBs don't need a redundant rebuild later.
 constexpr const char* kFtsSchemaSql = R"SQL(
 CREATE VIRTUAL TABLE IF NOT EXISTS disks_fts USING fts5(
-    title, filename, volume_label, files,
+    title, filename, volume_label, files, notes,
     tokenize = 'trigram'
 );
 )SQL";
 
 // Applied on migration 1 → 2 to populate the new FTS index from existing rows.
 constexpr const char* kFtsBackfillSql = R"SQL(
-INSERT INTO disks_fts (rowid, title, filename, volume_label, files)
+INSERT INTO disks_fts (rowid, title, filename, volume_label, files, notes)
 SELECT d.id,
        COALESCE(d.identified_title, ''),
        d.filename,
        COALESCE(d.volume_label, ''),
        COALESCE((SELECT GROUP_CONCAT(f.filename, ' ')
-                 FROM files f WHERE f.disk_id = d.id), '')
+                 FROM files f WHERE f.disk_id = d.id), ''),
+       ''
 FROM disks d;
 )SQL";
 
@@ -90,6 +92,38 @@ ALTER TABLE disks ADD COLUMN developer        TEXT;
 ALTER TABLE disks ADD COLUMN boxart_url       TEXT;
 ALTER TABLE disks ADD COLUMN screenshot_url   TEXT;
 ALTER TABLE disks ADD COLUMN screenscraper_id INTEGER;
+)SQL";
+
+// Applied on migration 7 → 8: rebuild disks_fts with an additional
+// `notes` column so user notes are searchable from the CLI `find`
+// command (the GUI search box already saw notes via the displayed
+// column). FTS5 doesn't support adding a column to an existing virtual
+// table, so we drop and recreate, then backfill from current data
+// including files, menu_contents, detected_games, and notes.
+constexpr const char* kFtsRebuildSql = R"SQL(
+DROP TABLE IF EXISTS disks_fts;
+
+CREATE VIRTUAL TABLE disks_fts USING fts5(
+    title, filename, volume_label, files, notes,
+    tokenize = 'trigram'
+);
+
+INSERT INTO disks_fts (rowid, title, filename, volume_label, files, notes)
+SELECT
+    d.id,
+    COALESCE(d.identified_title, ''),
+    d.filename,
+    COALESCE(d.volume_label, ''),
+    COALESCE((SELECT GROUP_CONCAT(f.filename, ' ')
+              FROM files f WHERE f.disk_id = d.id), '')
+    || ' '
+    || COALESCE((SELECT GROUP_CONCAT(m.game_name, ' ')
+                 FROM menu_contents m WHERE m.disk_id = d.id), '')
+    || ' '
+    || COALESCE((SELECT GROUP_CONCAT(g.game_name, ' ')
+                 FROM detected_games g WHERE g.disk_id = d.id), ''),
+    COALESCE(d.notes, '')
+FROM disks d;
 )SQL";
 
 constexpr const char* kSchemaSql = R"SQL(
@@ -235,6 +269,7 @@ struct Database::Impl {
     sqlite3_stmt* fts_delete{nullptr};
     sqlite3_stmt* fts_insert{nullptr};
     sqlite3_stmt* fts_update_files{nullptr};
+    sqlite3_stmt* fts_update_notes{nullptr};
     sqlite3_stmt* menu_delete{nullptr};
     sqlite3_stmt* menu_insert{nullptr};
     sqlite3_stmt* menu_select{nullptr};
@@ -257,6 +292,7 @@ struct Database::Impl {
                                  &delete_tags, &insert_tag, &select_by_hash,
                                  &select_files, &select_tags, &select_path_exists,
                                  &fts_delete, &fts_insert, &fts_update_files,
+                                 &fts_update_notes,
                                  &menu_delete, &menu_insert, &menu_select,
                                  &detected_delete, &detected_insert, &detected_select,
                                  &select_file_stat,
@@ -314,6 +350,10 @@ Database::Database(const std::filesystem::path& db_path)
     // v6 → v7: external-enrichment columns for ScreenScraper-style data.
     if (existing < 7) {
         exec(impl_->db, kEnrichmentSql);
+    }
+    // v7 → v8: rebuild FTS5 to include a notes column.
+    if (existing < 8 && existing >= 2) {
+        exec(impl_->db, kFtsRebuildSql);
     }
     if (existing < kSchemaVersion) {
         writeUserVersion(impl_->db, kSchemaVersion);
@@ -388,11 +428,13 @@ Database::Database(const std::filesystem::path& db_path)
 
     impl_->prepare(impl_->fts_delete, "DELETE FROM disks_fts WHERE rowid = ?1;");
     impl_->prepare(impl_->fts_insert, R"SQL(
-        INSERT INTO disks_fts (rowid, title, filename, volume_label, files)
-        VALUES (?1, ?2, ?3, ?4, '');
+        INSERT INTO disks_fts (rowid, title, filename, volume_label, files, notes)
+        VALUES (?1, ?2, ?3, ?4, '', '');
     )SQL");
     impl_->prepare(impl_->fts_update_files,
                    "UPDATE disks_fts SET files = ?1 WHERE rowid = ?2;");
+    impl_->prepare(impl_->fts_update_notes,
+                   "UPDATE disks_fts SET notes = ?1 WHERE rowid = ?2;");
 
     impl_->prepare(impl_->menu_delete, "DELETE FROM menu_contents WHERE disk_id = ?1;");
     impl_->prepare(impl_->menu_insert, R"SQL(
@@ -990,6 +1032,7 @@ void Database::rebuildDiskSets(const std::vector<DiskSet>& sets) {
 
 void Database::setNotes(int64_t id, const std::string& notes) {
     Transaction tx(*this);
+
     sqlite3_stmt* s = nullptr;
     if (sqlite3_prepare_v2(impl_->db,
             "UPDATE disks SET notes = ?1 WHERE id = ?2;", -1,
@@ -1004,6 +1047,18 @@ void Database::setNotes(int64_t id, const std::string& notes) {
         throwSqlite(impl_->db, "setNotes step");
     }
     sqlite3_finalize(s);
+
+    // Mirror into FTS so `find <term>` matches words in the note too.
+    // The FTS column is a literal string, never NULL — empty string
+    // means "no note" and matches nothing.
+    sqlite3_reset(impl_->fts_update_notes);
+    sqlite3_clear_bindings(impl_->fts_update_notes);
+    bindText          (impl_->fts_update_notes, 1, notes);
+    sqlite3_bind_int64(impl_->fts_update_notes, 2, id);
+    if (sqlite3_step(impl_->fts_update_notes) != SQLITE_DONE) {
+        throwSqlite(impl_->db, "setNotes fts_update_notes step");
+    }
+
     tx.commit();
 }
 

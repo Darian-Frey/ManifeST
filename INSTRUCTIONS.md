@@ -56,7 +56,7 @@ All subcommands accept `--db <path>` to target a specific database. Omit to use 
 
 | Command | What it does |
 |---|---|
-| `find <term>` | FTS5 substring search across title / publisher / label / filenames / menu games / detected games |
+| `find <term>` | FTS5 substring search across title / publisher / label / filenames / menu games / detected games / **notes** |
 | `list` | Every disk in the catalogue |
 | `info <id>` | Full record for one disk |
 | `launch <id>` | Exec Hatari with that disk |
